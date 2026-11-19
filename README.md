@@ -46,12 +46,19 @@ An open-source PrestaShop 8 performance suite built for **Apache / Nginx + PHP-F
 
 ## Installation
 
-1. Copy (or clone) this repository into your PrestaShop `modules/ps_redis_perf/` directory.
-2. Run `composer install --no-dev -o` inside `modules/ps_redis_perf/` (generates PSR-4 autoloading for the optional `ProductDuplicator` Symfony service).
+### Option A — PrestaShop Back Office (Recommended)
+1. Download `ps_redis_perf-v1.0.0.zip` from the [GitHub Releases](https://github.com/Bugfunder/ps_redis_perf/releases) page (includes pre-built Composer autoloader).
+2. Upload and install via **Back Office → Modules → Module Manager → Upload a module**.
+
+### Option B — From Source (Git)
+1. Clone this repository into your PrestaShop `modules/ps_redis_perf/` directory.
+2. Run `composer dump-autoload --no-dev -o` inside `modules/ps_redis_perf/` (generates PSR-4 autoloading for the optional `ProductDuplicator` Symfony service).
 3. Install via **Back Office → Modules → Module Manager** (or CLI `php bin/console prestashop:module install ps_redis_perf`).
-   * On install, the module registers its hooks, initializes safe default configuration, and creates the `ps_specific_price_best` and `ps_product_listing_view` MariaDB views if they do not already exist.
-4. Clear PrestaShop's class index and Symfony production cache (`var/cache/prod`), and reload PHP-FPM if OPcache timestamp validation is disabled.
-5. Configure everything under **Modules → Redis Performance & Drop Protection → Configure**.
+
+### Post-Install
+* On install, the module registers its hooks, initializes safe default configuration, and creates the `ps_specific_price_best` and `ps_product_listing_view` MariaDB views if they do not already exist.
+* Clear PrestaShop's class index and Symfony production cache (`var/cache/prod`), and reload PHP-FPM if OPcache timestamp validation is disabled.
+* Configure everything under **Modules → Redis Performance & Drop Protection → Configure**.
 
 ---
 
