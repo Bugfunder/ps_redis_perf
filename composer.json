@@ -1,0 +1,13 @@
+{
+  "name": "ps-redis-perf/ps_redis_perf",
+  "description": "PrestaShop 8 performance optimizations.",
+  "autoload": {
+    "psr-4": {
+      "PsRedisPerf\\": "src/"
+    }
+  },
+  "config": {
+    "prepend-autoloader": false
+  },
+  "type": "prestashop-module"
+}

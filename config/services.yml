@@ -1,0 +1,12 @@
+services:
+  _defaults:
+    autowire: true
+    autoconfigure: true
+    public: false
+
+  PsRedisPerf\Adapter\Product\Update\ProductDuplicator:
+    decorates: PrestaShop\PrestaShop\Adapter\Product\Update\ProductDuplicator
+    arguments:
+      $connection: '@doctrine.dbal.default_connection'
+      $dbPrefix: '%database_prefix%'
+      $productImageSystemPathFactory: '@prestashop.adapter.product.image.product_image_filesystem_path_factory'
