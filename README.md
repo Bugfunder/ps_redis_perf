@@ -1,6 +1,56 @@
 # PrestaShop 8 Front-Office Performance & Flash-Sale Protection (`ps_redis_perf`)
 
+[![PHP Lint](https://github.com/Bugfunder/ps_redis_perf/actions/workflows/lint.yml/badge.svg)](https://github.com/Bugfunder/ps_redis_perf/actions/workflows/lint.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![PrestaShop 8](https://img.shields.io/badge/PrestaShop-8.x-DF0067.svg)](https://github.com/PrestaShop/PrestaShop)
+
 An open-source PrestaShop 8 performance suite built for **Apache / Nginx + PHP-FPM + Redis + MariaDB**, focused on high-traffic front-office speed and high-contention limited-edition product drops.
+
+---
+
+## Architecture Overview
+
+```mermaid
+flowchart LR
+    U["Shopper Request (Guest / Logged-In / In-Cart)"] --> FC["FrontController::setMedia()"]
+    FC -->|"GET cacheable"| R1["Redis Shop FPC DB (DB 1, 2, 4+)"]
+    R1 -->|"HIT"| P["Personalize CSRF Tokens + #_desktop_cart (<1 ms)"]
+    P --> U
+    R1 -->|"MISS + Concurrent"| LK["Atomic Stampede Lock (SET NX EX 3)"]
+    LK -->|"Lock Holder (1st worker)"| PA["ProductAssembler + ps_product_listing_view + Bulk Prefetch"]
+    LK -->|"Other Workers"| W["Poll Redis (25 ms) -> HIT-WAIT"]
+    PA --> DB[("MariaDB")]
+    PA -->|"Store HTML (TTL <= next hold expiry)"| R1
+    W --> P
+
+    U -->|"POST Add to Cart / Pay"| CC["CartController / OrderController"]
+    CC -->|"Atomic Per-Item Mutex"| R3["Redis Stock Holds DB (DB 3 — Isolated)"]
+    R3 -->|"Available"| OK["Hold Unit (TTL 180s / 600s) + Flush Shop FPC"]
+    R3 -->|"Depleted"| REJ["Immediate Reject (Zero Oversell)"]
+```
+
+### Redis Database Isolation
+
+| Redis DB | Purpose | Flushing Behavior |
+| :--- | :--- | :--- |
+| `DB 0` | PHP Sessions (`session.save_handler = redis`) | Never touched by module flushes |
+| `DB 1`, `DB 2`, `DB 4+` | Per-shop Full-Page Microcache (auto-mapped per `id_shop`, skipping Reserve DB) | Flushed per shop on stock/order/BO events |
+| `DB 3` *(configurable)* | Atomic Stock Reservations (`sres:*`) | Completely isolated from FPC `FLUSHDB` |
+
+---
+
+## Production Benchmarks
+
+Measured on a real multi-shop PrestaShop 8.x store (**Apache + PHP 8.4-FPM + Redis + MariaDB**, heavy category pages with product combinations and filters):
+
+| Test Scenario | Result |
+| :--- | :--- |
+| **Sustained Load Test (20 RPS mixed category + product traffic)** | **314 / 314 HTTP 200**, **222 / 222** HTML integrity checks passed, **`p50 = 86.8 ms`**, **`p95 = 228.0 ms`**, **`p99 = 450.2 ms`** |
+| **Cold-Cache Stampede (10 simultaneous cold requests after flush)** | **`1 MISS` + `9 HIT-WAIT`** (1 MariaDB/Smarty render instead of 10) |
+| **Flash-Sale Contention (10 concurrent buyers carting 2 units)** | **`2 Succeeded` / `8 Blocked`** — **0 oversells**, holds auto-expire after configured TTL |
+| **Category Listing Cold Miss (`ps_product_listing_view` + bulk prefetch)** | **~5–10× fewer SQL queries** compared to vanilla `ProductAssemblerCore` |
+
+---
 
 ## Key Features
 
@@ -18,7 +68,7 @@ An open-source PrestaShop 8 performance suite built for **Apache / Nginx + PHP-F
 * **Hold-Aware FPC TTL Clamping:** Caps page-cache TTL to the earliest expiring active stock hold so abandoned carts automatically reappear in stock right when their hold expires.
 
 ### 3. Cold-Miss Database, Session & Query Optimizations
-* **MariaDB Category Listing View (`ps_product_listing_view`) + Bulk Prefetching:** Offloads category product assembly, combination stock, and price hydration to a MariaDB view (auto-created on install) paired with bulk prefetchers for images, combination images, features, and stock (`ProductAssembler`, `Product`, `StockAvailable`). Reduces category SQL queries by ~5–10× on cache misses.
+* **MariaDB Category Listing View (`ps_product_listing_view`) + Bulk Prefetching:** Offloads category product assembly, combination stock, and price hydration to a MariaDB view (auto-created on install) paired with bulk prefetchers for images, combination images, features, and stock (`ProductAssembler`, `Product`, `StockAvailable`).
 * **Session DB Write Throttling (`Cookie::getSession`):** Avoids running `UPDATE` queries on `ps_customer_session` / `ps_employee_session` on every page load by throttling writes to a configurable interval (default `300s`).
 * **Internal SQL Query Cache Bypass (`Cache::setQuery`):** Disables PrestaShop's legacy table-to-query cache map to eliminate serialization/write contention.
 * **Bulk Group Reduction & Multi-Format Image Duplication:** Single-query bulk `GroupReduction::duplicateReduction()` and multi-format (`jpg`/`webp`/`avif`/`2x`) file copy in `ProductDuplicator`.
@@ -34,20 +84,10 @@ An open-source PrestaShop 8 performance suite built for **Apache / Nginx + PHP-F
 
 ---
 
-## Architecture & Redis DB Layout
-
-| Redis DB | Purpose |
-| :--- | :--- |
-| `DB 0` | PHP Sessions (untouched by module flushes) |
-| `DB 1`, `DB 2`, `DB 4+` | Per-shop Full-Page Microcache (auto-mapped per active `id_shop`, skipping the Reserve DB) |
-| `DB 3` *(configurable)* | Atomic Stock Reservations (`sres:*`), completely isolated from FPC `FLUSHDB` |
-
----
-
 ## Installation
 
 ### Option A — PrestaShop Back Office (Recommended)
-1. Download `ps_redis_perf-v1.0.0.zip` from the [GitHub Releases](https://github.com/Bugfunder/ps_redis_perf/releases) page (includes pre-built Composer autoloader).
+1. Download the latest `ps_redis_perf-*.zip` from the [GitHub Releases](https://github.com/Bugfunder/ps_redis_perf/releases) page (includes pre-built Composer autoloader).
 2. Upload and install via **Back Office → Modules → Module Manager → Upload a module**.
 
 ### Option B — From Source (Git)
@@ -67,7 +107,7 @@ An open-source PrestaShop 8 performance suite built for **Apache / Nginx + PHP-F
 This module overrides the following PrestaShop core classes (check for conflicts if you use other override-heavy modules):
 
 * `override/classes/controller/FrontController.php` — Redis FPC, stampede lock, CSRF token/cart personalization, PayPal Option B guard
-* `override/classes/stock/StockAvailable.php` — Redis connection/DB mapping, atomic DB 3 stock reservations, bulk stock prefetching
+* `override/classes/stock/StockAvailable.php` — Redis connection/DB mapping, atomic stock reservations, bulk stock prefetching
 * `override/controllers/front/CartController.php` — Option A add-to-cart reservation & `$qty_to_check > 0` decrement guard
 * `override/controllers/front/OrderController.php` — Option B pre-payment reservation guard
 * `override/classes/ProductAssembler.php` — MariaDB listing view fast-path + bulk prefetching
@@ -80,7 +120,7 @@ This module overrides the following PrestaShop core classes (check for conflicts
 
 ## Caveats & Notes for Third-Party Themes
 
-* **Option 2 (In-Cart Caching)** expects Classic-theme `#_desktop_cart` header markup. If your theme uses a custom AJAX cart widget or different DOM wrapper, disable Option 2 in the Back Office settings (or adapt `prepareHtmlForFpcStorage()` / `renderFpcDesktopCartHtml()`).
+* **Option 2 (In-Cart Caching)** is disabled by default on fresh installs because it expects Classic-theme `#_desktop_cart` header markup. If your theme uses a custom AJAX cart widget or different DOM wrapper, leave Option 2 disabled or adapt `prepareHtmlForFpcStorage()` / `renderFpcDesktopCartHtml()`.
 * **SQL Listing View:** Automatically falls back to `ProductAssemblerCore` for non-standard customer groups (e.g., B2B wholesale groups) or if the SQL view is disabled/missing.
 
 ---

@@ -1,6 +1,7 @@
 {
   "name": "ps-redis-perf/ps_redis_perf",
-  "description": "PrestaShop 8 performance optimizations.",
+  "description": "PrestaShop 8 front-office performance suite: Redis Full-Page Microcache, Stampede Lock, Atomic Drop Stock Reservations & MariaDB Listing View.",
+  "license": "MIT",
   "autoload": {
     "psr-4": {
       "PsRedisPerf\\": "src/"
