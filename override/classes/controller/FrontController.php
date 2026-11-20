@@ -201,7 +201,7 @@ class FrontController extends FrontControllerCore
         if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'GET' || http_response_code() !== 200) {
             return null;
         }
-        if ($this->ajax || $this->content_only || $this->xml_output || !empty($this->errors) || !empty($this->warning) || !empty($this->success) || !empty($this->redirect_after)) {
+        if (!empty($this->ajax) || !empty($this->content_only) || !empty($this->xml_output) || !empty($this->errors) || !empty($this->warning) || !empty($this->success) || !empty($this->redirect_after)) {
             return null;
         }
         if ((defined('_PS_MODE_DEV_') && _PS_MODE_DEV_) || Configuration::get('PS_CATALOG_MODE')) {
