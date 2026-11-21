@@ -386,7 +386,9 @@ class StockAvailable extends StockAvailableCore
             $availableForMe = max(0, $physicalQty - $reservedByOthers);
 
             if ($targetQty > $availableForMe) {
-                @$redis->incr('sres:stats:s' . $idShop . ':blocked');
+                if ($reservedByOthers > 0 && $targetQty <= $physicalQty) {
+                    @$redis->incr('sres:stats:s' . $idShop . ':blocked');
+                }
                 return [
                     'ok' => false,
                     'available' => $availableForMe,

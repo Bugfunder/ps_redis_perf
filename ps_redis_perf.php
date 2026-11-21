@@ -444,26 +444,19 @@ class Ps_redis_perf extends Module
         $managedShops = $this->getManagedShops();
         $allShopDbs = $this->getAllShopFpcDbs();
         $reserveDb = $this->getReserveDbIndex();
+        $baseUrl = AdminController::$currentIndex . '&configure=' . $this->name . '&token=' . Tools::getAdminTokenLite('AdminModules');
 
         if (Tools::isSubmit('submitFlushPsRedisPerfCacheAll')) {
             $this->purgeRedisPageCache(false, $allShopDbs);
-            $output .= $this->displayConfirmation(sprintf(
-                $this->l('Flushed Redis Page Cache for all active shops (DB %s). DB 0 sessions and DB %d stock holds untouched.'),
-                implode(', ', $allShopDbs),
-                $reserveDb
-            ));
+            Tools::redirectAdmin($baseUrl . '&perf_conf=flush_all');
         } elseif (Tools::isSubmit('submitFlushPsRedisPerfCacheShop')) {
             $flushShopId = (int) Tools::getValue('flush_shop_id');
             if (isset($managedShops[$flushShopId])) {
                 $targetDb = (int) $managedShops[$flushShopId]['db'];
                 $this->purgeRedisPageCache(false, [$targetDb]);
-                $output .= $this->displayConfirmation(sprintf(
-                    $this->l('Flushed %s Page Cache (Redis DB %d). Other shops, DB 0 sessions, and DB %d stock holds untouched.'),
-                    $managedShops[$flushShopId]['name'],
-                    $targetDb,
-                    $reserveDb
-                ));
+                Tools::redirectAdmin($baseUrl . '&perf_conf=flush_shop&perf_shop=' . $flushShopId);
             }
+            Tools::redirectAdmin($baseUrl);
         } elseif (Tools::isSubmit('submitClearPsRedisPerfReservations')) {
             $rRes = $this->getFpcRedis($reserveDb);
             if ($rRes !== null) {
@@ -487,10 +480,7 @@ class Ps_redis_perf extends Module
                 }
             }
             $this->purgeRedisPageCache(false, $allShopDbs);
-            $output .= $this->displayConfirmation(sprintf(
-                $this->l('All active Redis DB %d stock holds have been cleared and page caches refreshed.'),
-                $reserveDb
-            ));
+            Tools::redirectAdmin($baseUrl . '&perf_conf=clear_holds');
         } elseif (Tools::isSubmit('submitResetPsRedisPerfStats')) {
             $r = $this->getFpcRedis();
             if ($r !== null) {
@@ -511,7 +501,7 @@ class Ps_redis_perf extends Module
                     }
                 }
             }
-            $output .= $this->displayConfirmation($this->l('Cache hit/miss and reservation statistics have been reset.'));
+            Tools::redirectAdmin($baseUrl . '&perf_conf=reset_stats');
         } elseif (Tools::isSubmit('submitPsRedisPerfConfig')) {
             $redisHost = trim((string) Tools::getValue('PS_REDIS_PERF_REDIS_HOST', '127.0.0.1'));
             if ($redisHost === '') {
@@ -596,6 +586,34 @@ class Ps_redis_perf extends Module
                 }
             }
             $this->purgeRedisPageCache(false, $allShopDbs);
+            Tools::redirectAdmin($baseUrl . '&perf_conf=saved');
+        }
+
+        $perfConf = (string) Tools::getValue('perf_conf', '');
+        if ($perfConf === 'flush_all') {
+            $output .= $this->displayConfirmation(sprintf(
+                $this->l('Flushed Redis Page Cache for all active shops (DB %s). DB 0 sessions and DB %d stock holds untouched.'),
+                implode(', ', $allShopDbs),
+                $reserveDb
+            ));
+        } elseif ($perfConf === 'flush_shop') {
+            $perfShopId = (int) Tools::getValue('perf_shop');
+            if (isset($managedShops[$perfShopId])) {
+                $output .= $this->displayConfirmation(sprintf(
+                    $this->l('Flushed %s Page Cache (Redis DB %d). Other shops, DB 0 sessions, and DB %d stock holds untouched.'),
+                    $managedShops[$perfShopId]['name'],
+                    (int) $managedShops[$perfShopId]['db'],
+                    $reserveDb
+                ));
+            }
+        } elseif ($perfConf === 'clear_holds') {
+            $output .= $this->displayConfirmation(sprintf(
+                $this->l('All active Redis DB %d stock holds have been cleared and page caches refreshed.'),
+                $reserveDb
+            ));
+        } elseif ($perfConf === 'reset_stats') {
+            $output .= $this->displayConfirmation($this->l('Cache hit/miss and reservation statistics have been reset.'));
+        } elseif ($perfConf === 'saved') {
             $output .= $this->displayConfirmation($this->l('Settings updated and Redis page caches refreshed.'));
         }
 
