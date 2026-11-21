@@ -12,7 +12,7 @@ class Ps_redis_perf extends Module
     {
         $this->name = 'ps_redis_perf';
         $this->tab = 'administration';
-        $this->version = '1.0.2';
+        $this->version = '1.0.3';
         $this->author = 'Slingomama';
         $this->need_instance = 0;
         $this->bootstrap = true;
