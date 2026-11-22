@@ -46,6 +46,7 @@ class Ps_redis_perf extends Module
             'PS_REDIS_PERF_FPC_STAMPEDE_LOCK',
             'PS_REDIS_PERF_FPC_STAMPEDE_WAIT_MS',
             'PS_REDIS_PERF_FPC_TTL',
+            'PS_REDIS_PERF_FPC_SLIDING_TTL',
             'PS_REDIS_PERF_FPC_CONTROLLERS',
             'PS_REDIS_PERF_FPC_HIT_HOOK_MODULES',
             'PS_REDIS_PERF_FPC_AUTOFLUSH_BO_EDITS',
@@ -78,6 +79,7 @@ class Ps_redis_perf extends Module
             'PS_REDIS_PERF_FPC_STAMPEDE_LOCK' => '1',
             'PS_REDIS_PERF_FPC_STAMPEDE_WAIT_MS' => '1500',
             'PS_REDIS_PERF_FPC_TTL' => '300',
+            'PS_REDIS_PERF_FPC_SLIDING_TTL' => '1',
             'PS_REDIS_PERF_FPC_CONTROLLERS' => 'index,category,product,cms,manufacturer,prices-drop,new-products,best-sales,sitemap',
             'PS_REDIS_PERF_FPC_AUTOFLUSH_BO_EDITS' => '1',
             'PS_REDIS_PERF_RESERVE_SHOPS' => 'all',
@@ -527,6 +529,7 @@ class Ps_redis_perf extends Module
             $stampedeLock = (int) Tools::getValue('PS_REDIS_PERF_FPC_STAMPEDE_LOCK');
             $stampedeWaitMs = max(100, min(5000, (int) Tools::getValue('PS_REDIS_PERF_FPC_STAMPEDE_WAIT_MS', 1500)));
             $ttl = max(10, min(86400, (int) Tools::getValue('PS_REDIS_PERF_FPC_TTL', 300)));
+            $slidingTtl = (int) Tools::getValue('PS_REDIS_PERF_FPC_SLIDING_TTL');
             $controllersRaw = (string) Tools::getValue('PS_REDIS_PERF_FPC_CONTROLLERS', '');
             $controllersList = array_filter(array_map(function ($c) {
                 return preg_replace('/[^a-z0-9_-]/', '', strtolower(trim($c)));
@@ -566,6 +569,7 @@ class Ps_redis_perf extends Module
             Configuration::updateGlobalValue('PS_REDIS_PERF_FPC_STAMPEDE_LOCK', (string) $stampedeLock);
             Configuration::updateGlobalValue('PS_REDIS_PERF_FPC_STAMPEDE_WAIT_MS', (string) $stampedeWaitMs);
             Configuration::updateGlobalValue('PS_REDIS_PERF_FPC_TTL', (string) $ttl);
+            Configuration::updateGlobalValue('PS_REDIS_PERF_FPC_SLIDING_TTL', (string) $slidingTtl);
             Configuration::updateGlobalValue('PS_REDIS_PERF_FPC_CONTROLLERS', implode(',', $controllersList));
             Configuration::updateGlobalValue('PS_REDIS_PERF_FPC_HIT_HOOK_MODULES', implode(',', $hitModulesList));
             Configuration::updateGlobalValue('PS_REDIS_PERF_FPC_AUTOFLUSH_BO_EDITS', (string) $autoFlushBoEdits);
@@ -806,6 +810,8 @@ class Ps_redis_perf extends Module
         if ($stampedeWaitMs < 100) {
             $stampedeWaitMs = 1500;
         }
+        $slidingCfg = Configuration::getGlobalValue('PS_REDIS_PERF_FPC_SLIDING_TTL');
+        $slidingTtl = ($slidingCfg === false || $slidingCfg === null || (int) $slidingCfg === 1);
 
         $modeDesc = [];
         if ($enabled) {
@@ -818,6 +824,9 @@ class Ps_redis_perf extends Module
             }
             if ($stampedeLock) {
                 $modeDesc[] = 'Stampede Lock (' . $stampedeWaitMs . 'ms max wait)';
+            }
+            if ($slidingTtl) {
+                $modeDesc[] = 'Sliding TTL';
             }
         }
         $activeModesHtml = !empty($modeDesc) ? implode(' &bull; ', $modeDesc) : 'Cache Disabled';
@@ -1088,6 +1097,17 @@ class Ps_redis_perf extends Module
                         'desc' => $this->l('Default: 300 seconds (5 minutes). Note: the cache is also flushed automatically whenever stock changes or an order is placed.'),
                     ],
                     [
+                        'type' => 'switch',
+                        'label' => $this->l('Sliding TTL (Prolong on Cache Hit)'),
+                        'name' => 'PS_REDIS_PERF_FPC_SLIDING_TTL',
+                        'is_bool' => true,
+                        'desc' => $this->l('Resets a cached page\'s TTL back to the configured Cache Lifetime whenever it receives a cache HIT (throttled to at most once every 5s per page). Applies only to page caches (never extends Redis DB 3 stock holds, and still respects active hold expiry caps).'),
+                        'values' => [
+                            ['id' => 'fpc_sliding_ttl_on', 'value' => 1, 'label' => $this->l('Enabled')],
+                            ['id' => 'fpc_sliding_ttl_off', 'value' => 0, 'label' => $this->l('Disabled')],
+                        ],
+                    ],
+                    [
                         'type' => 'text',
                         'label' => $this->l('Cacheable Front Controllers'),
                         'name' => 'PS_REDIS_PERF_FPC_CONTROLLERS',
@@ -1258,6 +1278,7 @@ class Ps_redis_perf extends Module
                 'PS_REDIS_PERF_FPC_STAMPEDE_LOCK' => (int) Configuration::getGlobalValue('PS_REDIS_PERF_FPC_STAMPEDE_LOCK'),
                 'PS_REDIS_PERF_FPC_STAMPEDE_WAIT_MS' => (int) Configuration::getGlobalValue('PS_REDIS_PERF_FPC_STAMPEDE_WAIT_MS'),
                 'PS_REDIS_PERF_FPC_TTL' => (int) Configuration::getGlobalValue('PS_REDIS_PERF_FPC_TTL'),
+                'PS_REDIS_PERF_FPC_SLIDING_TTL' => (Configuration::getGlobalValue('PS_REDIS_PERF_FPC_SLIDING_TTL') !== '0') ? 1 : 0,
                 'PS_REDIS_PERF_FPC_CONTROLLERS' => (string) Configuration::getGlobalValue('PS_REDIS_PERF_FPC_CONTROLLERS'),
                 'PS_REDIS_PERF_FPC_HIT_HOOK_MODULES' => (string) Configuration::getGlobalValue('PS_REDIS_PERF_FPC_HIT_HOOK_MODULES'),
                 'PS_REDIS_PERF_FPC_AUTOFLUSH_BO_EDITS' => (Configuration::getGlobalValue('PS_REDIS_PERF_FPC_AUTOFLUSH_BO_EDITS') !== '0') ? 1 : 0,

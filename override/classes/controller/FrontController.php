@@ -515,6 +515,29 @@ class FrontController extends FrontControllerCore
                                 @$redis->lTrim('fpc:stats:recent_wait_hits', 0, 19);
                             }
                         }
+                        // Sliding TTL for page caches only (never extends DB 3 stock holds, and respects active hold caps)
+                        $slidingCfg = Configuration::getGlobalValue('PS_REDIS_PERF_FPC_SLIDING_TTL');
+                        $slidingEnabled = ($slidingCfg === false || $slidingCfg === null || (int) $slidingCfg === 1);
+                        if (!$waitedForLock && $slidingEnabled) {
+                            $ttl = (int) Configuration::getGlobalValue('PS_REDIS_PERF_FPC_TTL');
+                            if ($ttl < 10) {
+                                $ttl = (int) $this->fpcTtl;
+                            }
+                            $remTtl = @$redis->ttl($cacheKey);
+                            // Throttle writes: skip DB 3 check and EXPIRE if refreshed within the last 5 seconds
+                            if (is_int($remTtl) && $remTtl > 0 && $remTtl < ($ttl - 5)) {
+                                $extendTtl = $ttl;
+                                if (method_exists('StockAvailable', 'getNextExpiringHoldSeconds')) {
+                                    $nextHoldSec = StockAvailable::getNextExpiringHoldSeconds((int) ($this->context->shop->id ?? 1));
+                                    if ($nextHoldSec !== null) {
+                                        $extendTtl = max(5, min($ttl, $nextHoldSec + 1));
+                                    }
+                                }
+                                if ($remTtl < ($extendTtl - 5)) {
+                                    @$redis->expire($cacheKey, $extendTtl);
+                                }
+                            }
+                        }
                         $personalizedHtml = $this->personalizeFpcCachedHtml($cachedHtml);
                         if (!headers_sent()) {
                             header('X-Page-Cache: ' . $modeHeader);
