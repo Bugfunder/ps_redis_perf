@@ -442,6 +442,7 @@ class FrontController extends FrontControllerCore
                     }
                     $cachedHtml = $redis->get($cacheKey);
                     $waitedForLock = false;
+                    $waitedMs = 0;
 
                     // Cold-Cache Stampede Protection (Dog-Pile Lock)
                     if ((!is_string($cachedHtml) || strlen($cachedHtml) <= 1000) && (int) Configuration::getGlobalValue('PS_REDIS_PERF_FPC_STAMPEDE_LOCK') === 1) {
@@ -490,6 +491,7 @@ class FrontController extends FrontControllerCore
                         $this->context->cookie->write();
                         $isLogged = (bool) ($this->context->customer && $this->context->customer->isLogged());
                         $cartCount = ($this->context->cart && $this->context->cart->id) ? (int) $this->context->cart->nbProducts() : 0;
+                        $modeHeader = $isLogged ? ($cartCount > 0 ? 'HIT-LOGGED-CART' : 'HIT-LOGGED') : ($cartCount > 0 ? 'HIT-GUEST-CART' : 'HIT');
                         @$redis->incr('fpc:stats:hits');
                         if ($isLogged) {
                             @$redis->incr('fpc:stats:logged_hits');
@@ -498,14 +500,23 @@ class FrontController extends FrontControllerCore
                             @$redis->incr('fpc:stats:cart_hits');
                         }
                         if ($waitedForLock) {
+                            $modeHeader .= '-WAIT';
                             @$redis->incr('fpc:stats:wait_hits');
+                            $waitEntry = json_encode([
+                                'ts' => date('Y-m-d H:i:s'),
+                                'url' => substr((string) ($_SERVER['REQUEST_URI'] ?? '/'), 0, 200),
+                                'wait_ms' => (int) $waitedMs,
+                                'mode' => $modeHeader,
+                                'ip' => (string) ($_SERVER['REMOTE_ADDR'] ?? ''),
+                                'ua' => substr((string) ($_SERVER['HTTP_USER_AGENT'] ?? ''), 0, 100),
+                            ], JSON_UNESCAPED_SLASHES);
+                            if (is_string($waitEntry)) {
+                                @$redis->lPush('fpc:stats:recent_wait_hits', $waitEntry);
+                                @$redis->lTrim('fpc:stats:recent_wait_hits', 0, 19);
+                            }
                         }
                         $personalizedHtml = $this->personalizeFpcCachedHtml($cachedHtml);
                         if (!headers_sent()) {
-                            $modeHeader = $isLogged ? ($cartCount > 0 ? 'HIT-LOGGED-CART' : 'HIT-LOGGED') : ($cartCount > 0 ? 'HIT-GUEST-CART' : 'HIT');
-                            if ($waitedForLock) {
-                                $modeHeader .= '-WAIT';
-                            }
                             header('X-Page-Cache: ' . $modeHeader);
                             header('Content-Type: text/html; charset=utf-8');
                         }

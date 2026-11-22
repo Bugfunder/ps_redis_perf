@@ -736,6 +736,7 @@ class StockAvailable extends StockAvailableCore
             $loggedHits = @$r->get('fpc:stats:logged_hits');
             $cartHits = @$r->get('fpc:stats:cart_hits');
             $waitHits = @$r->get('fpc:stats:wait_hits');
+            $recentWaitHits = @$r->lRange('fpc:stats:recent_wait_hits', 0, 19);
             @$r->flushDB();
             if ($disabled === '1') {
                 @$r->set('fpc:disabled', '1');
@@ -754,6 +755,12 @@ class StockAvailable extends StockAvailableCore
             }
             if ($waitHits !== false) {
                 @$r->set('fpc:stats:wait_hits', (int) $waitHits);
+            }
+            if (is_array($recentWaitHits) && !empty($recentWaitHits)) {
+                foreach ($recentWaitHits as $rwItem) {
+                    @$r->rPush('fpc:stats:recent_wait_hits', $rwItem);
+                }
+                @$r->lTrim('fpc:stats:recent_wait_hits', 0, 19);
             }
         } catch (\Throwable $e) {
             // Ignore

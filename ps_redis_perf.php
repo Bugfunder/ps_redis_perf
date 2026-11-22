@@ -364,6 +364,7 @@ class Ps_redis_perf extends Module
                     $loggedHits = $resetStats ? false : @$r->get('fpc:stats:logged_hits');
                     $cartHits = $resetStats ? false : @$r->get('fpc:stats:cart_hits');
                     $waitHits = $resetStats ? false : @$r->get('fpc:stats:wait_hits');
+                    $recentWaitHits = $resetStats ? false : @$r->lRange('fpc:stats:recent_wait_hits', 0, 19);
 
                     @$r->flushDB();
 
@@ -385,6 +386,12 @@ class Ps_redis_perf extends Module
                         }
                         if ($waitHits !== false) {
                             @$r->set('fpc:stats:wait_hits', (int) $waitHits);
+                        }
+                        if (is_array($recentWaitHits) && !empty($recentWaitHits)) {
+                            foreach ($recentWaitHits as $rwItem) {
+                                @$r->rPush('fpc:stats:recent_wait_hits', $rwItem);
+                            }
+                            @$r->lTrim('fpc:stats:recent_wait_hits', 0, 19);
                         }
                     }
                 } catch (\Throwable $e) {
@@ -656,6 +663,7 @@ class Ps_redis_perf extends Module
                 'logged_hits' => 0,
                 'cart_hits' => 0,
                 'wait_hits' => 0,
+                'recent_wait_hits' => [],
             ];
         }
 
@@ -701,6 +709,17 @@ class Ps_redis_perf extends Module
                         $st['logged_hits'] = (int) @$r->get('fpc:stats:logged_hits');
                         $st['cart_hits'] = (int) @$r->get('fpc:stats:cart_hits');
                         $st['wait_hits'] = (int) @$r->get('fpc:stats:wait_hits');
+                        $rawRecentWaits = @$r->lRange('fpc:stats:recent_wait_hits', 0, 19);
+                        if (is_array($rawRecentWaits)) {
+                            foreach ($rawRecentWaits as $rwRaw) {
+                                if (is_string($rwRaw)) {
+                                    $rwDecoded = json_decode($rwRaw, true);
+                                    if (is_array($rwDecoded)) {
+                                        $st['recent_wait_hits'][] = $rwDecoded;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 unset($st);
@@ -809,6 +828,30 @@ class Ps_redis_perf extends Module
             $dbId = (int) $st['db'];
             $tot = $st['hits'] + $st['misses'];
             $rate = $tot > 0 ? round(($st['hits'] / $tot) * 100, 1) . '%' : '0.0%';
+            $recentWaitsHtml = '';
+            if (!empty($st['recent_wait_hits'])) {
+                $rowsHtml = '';
+                foreach ($st['recent_wait_hits'] as $rw) {
+                    $rowsHtml .= '<tr>'
+                        . '<td style="white-space:nowrap;">' . htmlspecialchars((string) ($rw['ts'] ?? ''), ENT_QUOTES, 'UTF-8') . '</td>'
+                        . '<td style="white-space:nowrap;">' . (int) ($rw['wait_ms'] ?? 0) . 'ms</td>'
+                        . '<td style="white-space:nowrap;"><code>' . htmlspecialchars((string) ($rw['mode'] ?? ''), ENT_QUOTES, 'UTF-8') . '</code></td>'
+                        . '<td style="word-break:break-all;">' . htmlspecialchars((string) ($rw['url'] ?? ''), ENT_QUOTES, 'UTF-8') . '</td>'
+                        . '<td style="white-space:nowrap;">' . htmlspecialchars((string) ($rw['ip'] ?? ''), ENT_QUOTES, 'UTF-8') . '</td>'
+                        . '<td style="word-break:break-word;max-width:220px;">' . htmlspecialchars((string) ($rw['ua'] ?? ''), ENT_QUOTES, 'UTF-8') . '</td>'
+                        . '</tr>';
+                }
+                $recentWaitsHtml = '
+                        <details style="margin-top:10px;border-top:1px solid #ddd;padding-top:8px;">
+                            <summary style="cursor:pointer;font-size:12px;color:#555;">' . sprintf($this->l('Recent Stampede Saves (last %d)'), count($st['recent_wait_hits'])) . '</summary>
+                            <div style="overflow-x:auto;margin-top:6px;">
+                                <table class="table table-condensed" style="font-size:11px;margin-bottom:0;background:#fff;">
+                                    <thead><tr><th>Time</th><th>Wait</th><th>Mode</th><th>URL</th><th>IP</th><th>User-Agent</th></tr></thead>
+                                    <tbody>' . $rowsHtml . '</tbody>
+                                </table>
+                            </div>
+                        </details>';
+            }
             $shopCardsHtml .= '
                 <div class="' . $colClass . '">
                     <div class="well" style="margin-bottom:12px;">
@@ -840,7 +883,7 @@ class Ps_redis_perf extends Module
                                     Stampede Saved: <strong>' . (int) $st['wait_hits'] . '</strong>
                                 </div>
                             </div>
-                        </div>
+                        </div>' . $recentWaitsHtml . '
                     </div>
                 </div>';
         }
