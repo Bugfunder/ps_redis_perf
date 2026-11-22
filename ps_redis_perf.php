@@ -832,34 +832,18 @@ class Ps_redis_perf extends Module
         $activeModesHtml = !empty($modeDesc) ? implode(' &bull; ', $modeDesc) : 'Cache Disabled';
 
         $shopCardsHtml = '';
+        $allRecentWaits = [];
         $colClass = (count($shopStats) >= 3) ? 'col-md-4' : ((count($shopStats) === 1) ? 'col-md-12' : 'col-md-6');
         foreach ($shopStats as $sid => $st) {
             $dbId = (int) $st['db'];
             $tot = $st['hits'] + $st['misses'];
             $rate = $tot > 0 ? round(($st['hits'] / $tot) * 100, 1) . '%' : '0.0%';
-            $recentWaitsHtml = '';
             if (!empty($st['recent_wait_hits'])) {
-                $rowsHtml = '';
+                $shopNameOnly = explode(' (', (string) $st['label'])[0];
                 foreach ($st['recent_wait_hits'] as $rw) {
-                    $rowsHtml .= '<tr>'
-                        . '<td style="white-space:nowrap;">' . htmlspecialchars((string) ($rw['ts'] ?? ''), ENT_QUOTES, 'UTF-8') . '</td>'
-                        . '<td style="white-space:nowrap;">' . (int) ($rw['wait_ms'] ?? 0) . 'ms</td>'
-                        . '<td style="white-space:nowrap;"><code>' . htmlspecialchars((string) ($rw['mode'] ?? ''), ENT_QUOTES, 'UTF-8') . '</code></td>'
-                        . '<td style="word-break:break-all;">' . htmlspecialchars((string) ($rw['url'] ?? ''), ENT_QUOTES, 'UTF-8') . '</td>'
-                        . '<td style="white-space:nowrap;">' . htmlspecialchars((string) ($rw['ip'] ?? ''), ENT_QUOTES, 'UTF-8') . '</td>'
-                        . '<td style="word-break:break-word;max-width:220px;">' . htmlspecialchars((string) ($rw['ua'] ?? ''), ENT_QUOTES, 'UTF-8') . '</td>'
-                        . '</tr>';
+                    $rw['shop'] = $shopNameOnly . ' (DB ' . $dbId . ')';
+                    $allRecentWaits[] = $rw;
                 }
-                $recentWaitsHtml = '
-                        <details style="margin-top:10px;border-top:1px solid #ddd;padding-top:8px;">
-                            <summary style="cursor:pointer;font-size:12px;color:#555;">' . sprintf($this->l('Recent Stampede Saves (last %d)'), count($st['recent_wait_hits'])) . '</summary>
-                            <div style="overflow-x:auto;margin-top:6px;">
-                                <table class="table table-condensed" style="font-size:11px;margin-bottom:0;background:#fff;">
-                                    <thead><tr><th>Time</th><th>Wait</th><th>Mode</th><th>URL</th><th>IP</th><th>User-Agent</th></tr></thead>
-                                    <tbody>' . $rowsHtml . '</tbody>
-                                </table>
-                            </div>
-                        </details>';
             }
             $shopCardsHtml .= '
                 <div class="' . $colClass . '">
@@ -892,9 +876,55 @@ class Ps_redis_perf extends Module
                                     Stampede Saved: <strong>' . (int) $st['wait_hits'] . '</strong>
                                 </div>
                             </div>
-                        </div>' . $recentWaitsHtml . '
+                        </div>
                     </div>
                 </div>';
+        }
+
+        $stampedeTableHtml = '';
+        if (!empty($allRecentWaits)) {
+            usort($allRecentWaits, function ($a, $b) {
+                return strcmp((string) ($b['ts'] ?? ''), (string) ($a['ts'] ?? ''));
+            });
+            $allRecentWaits = array_slice($allRecentWaits, 0, 20);
+            $rowsHtml = '';
+            foreach ($allRecentWaits as $rw) {
+                $rowsHtml .= '<tr>'
+                    . '<td style="white-space:nowrap;"><strong>' . htmlspecialchars((string) ($rw['shop'] ?? ''), ENT_QUOTES, 'UTF-8') . '</strong></td>'
+                    . '<td style="white-space:nowrap;">' . htmlspecialchars((string) ($rw['ts'] ?? ''), ENT_QUOTES, 'UTF-8') . '</td>'
+                    . '<td style="white-space:nowrap;">' . (int) ($rw['wait_ms'] ?? 0) . 'ms</td>'
+                    . '<td style="white-space:nowrap;"><code>' . htmlspecialchars((string) ($rw['mode'] ?? ''), ENT_QUOTES, 'UTF-8') . '</code></td>'
+                    . '<td style="min-width:300px;width:38%;word-break:break-word;overflow-wrap:anywhere;">' . htmlspecialchars((string) ($rw['url'] ?? ''), ENT_QUOTES, 'UTF-8') . '</td>'
+                    . '<td style="white-space:nowrap;">' . htmlspecialchars((string) ($rw['ip'] ?? ''), ENT_QUOTES, 'UTF-8') . '</td>'
+                    . '<td style="min-width:280px;width:32%;word-break:break-word;overflow-wrap:anywhere;">' . htmlspecialchars((string) ($rw['ua'] ?? ''), ENT_QUOTES, 'UTF-8') . '</td>'
+                    . '</tr>';
+            }
+            $stampedeTableHtml = '
+            <div class="row" style="margin-bottom:10px;">
+                <div class="col-md-12">
+                    <div class="well" style="margin-bottom:12px;padding:10px 15px;">
+                        <details>
+                            <summary style="cursor:pointer;font-size:13px;font-weight:600;color:#444;">' . sprintf($this->l('Recent Stampede Saves (last %d)'), count($allRecentWaits)) . '</summary>
+                            <div style="overflow-x:auto;margin-top:8px;">
+                                <table class="table table-condensed table-striped" style="font-size:12px;margin-bottom:0;background:#fff;width:100%;">
+                                    <thead>
+                                        <tr>
+                                            <th style="white-space:nowrap;">Shop</th>
+                                            <th style="white-space:nowrap;">Time</th>
+                                            <th style="white-space:nowrap;">Wait</th>
+                                            <th style="white-space:nowrap;">Mode</th>
+                                            <th style="min-width:300px;width:38%;">URL</th>
+                                            <th style="white-space:nowrap;">IP</th>
+                                            <th style="min-width:280px;width:32%;">User-Agent</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>' . $rowsHtml . '</tbody>
+                                </table>
+                            </div>
+                        </details>
+                    </div>
+                </div>
+            </div>';
         }
 
         $sqlViewEnabled = (Configuration::getGlobalValue('PS_REDIS_PERF_SQL_VIEW_ENABLED') !== '0');
@@ -951,7 +981,7 @@ class Ps_redis_perf extends Module
             </div>
             <div class="row" style="margin-bottom:10px;">
                 ' . $shopCardsHtml . '
-            </div>
+            </div>' . $stampedeTableHtml . '
             <div class="alert alert-info" style="margin-bottom:15px;">
                 <strong>' . $this->l('Active Page Cache Coverage') . ':</strong> ' . $activeModesHtml . '<br>
                 <strong>' . $this->l('Zero-Oversell Stock Holds Scope') . ':</strong> ' . htmlspecialchars($scopeLabel, ENT_QUOTES, 'UTF-8') . ' (Active holds: ' . $holdsPerShopHtml . ')<br>
