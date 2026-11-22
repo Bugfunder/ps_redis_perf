@@ -72,7 +72,7 @@ class CartController extends CartControllerCore
         }
 
         // Check product quantity availability
-        if ('update' !== $mode && $qty_to_check > 0 && $this->shouldAvailabilityErrorBeRaised($product, $qty_to_check)) {
+        if ('update' !== $mode && $this->shouldAvailabilityErrorBeRaised($product, $qty_to_check)) {
             /*
              * If the product can't be in the cart in this quantity, we raise an error.
              * For the purpose of this error message, we must get the real quantity in stock.
@@ -203,7 +203,7 @@ class CartController extends CartControllerCore
                     [],
                     'Shop.Notifications.Error'
                 );
-            } elseif ($qty_to_check > 0 && $this->shouldAvailabilityErrorBeRaised($product, $qty_to_check)) {
+            } elseif ($this->shouldAvailabilityErrorBeRaised($product, $qty_to_check)) {
                 /*
                  * If the product can't be in the cart in this quantity, we raise an error.
                  * For the purpose of this error message, we must get the real quantity in stock.

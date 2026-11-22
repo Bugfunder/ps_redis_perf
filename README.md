@@ -108,7 +108,7 @@ This module overrides the following PrestaShop core classes (check for conflicts
 
 * `override/classes/controller/FrontController.php` — Redis FPC, stampede lock, CSRF token/cart personalization, PayPal Option B guard
 * `override/classes/stock/StockAvailable.php` — Redis connection/DB mapping, atomic stock reservations, bulk stock prefetching
-* `override/controllers/front/CartController.php` — Option A add-to-cart reservation & `$qty_to_check > 0` decrement guard
+* `override/controllers/front/CartController.php` — Option A add-to-cart reservation
 * `override/controllers/front/OrderController.php` — Option B pre-payment reservation guard
 * `override/classes/ProductAssembler.php` — MariaDB listing view fast-path + bulk prefetching
 * `override/classes/Product.php` — Bulk image, combination image, and front feature caches
