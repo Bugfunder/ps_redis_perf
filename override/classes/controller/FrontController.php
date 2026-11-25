@@ -462,6 +462,63 @@ class FrontController extends FrontControllerCore
     }
 
     /**
+     * Resolve Redis invalidation tag keys for the current FrontController request.
+     *
+     * @return array<string>
+     */
+    protected function getFpcTagsForCurrentRequest()
+    {
+        $ctrl = (string) ($this->php_self ?? '');
+        if ($ctrl === 'product') {
+            $idProd = 0;
+            if (isset($this->product) && is_object($this->product) && isset($this->product->id)) {
+                $idProd = (int) $this->product->id;
+            }
+            if ($idProd <= 0) {
+                $idProd = (int) Tools::getValue('id_product');
+            }
+            return $idProd > 0 ? ['fpc:tag:p:' . $idProd] : [];
+        }
+        if ($ctrl === 'category') {
+            $idCat = 0;
+            if (isset($this->category) && is_object($this->category) && isset($this->category->id)) {
+                $idCat = (int) $this->category->id;
+            }
+            if ($idCat <= 0) {
+                $idCat = (int) Tools::getValue('id_category');
+            }
+            return $idCat > 0 ? ['fpc:tag:c:' . $idCat] : [];
+        }
+        if (in_array($ctrl, ['index', 'prices-drop', 'new-products', 'best-sales', 'manufacturer'], true)) {
+            return ['fpc:tag:listings'];
+        }
+        return [];
+    }
+
+    /**
+     * Register a cached FPC key against entity/listing tag sets for targeted invalidation.
+     *
+     * @param \Redis $redis
+     * @param string $cacheKey
+     * @param int $ttl
+     */
+    protected function registerFpcCacheTags($redis, $cacheKey, $ttl)
+    {
+        $tags = $this->getFpcTagsForCurrentRequest();
+        if (empty($tags)) {
+            return;
+        }
+        $tagTtl = max((int) $ttl + 120, 600);
+        foreach ($tags as $tagKey) {
+            @$redis->sAdd($tagKey, $cacheKey);
+            $curTagTtl = @$redis->ttl($tagKey);
+            if (!is_int($curTagTtl) || $curTagTtl < $tagTtl) {
+                @$redis->expire($tagKey, $tagTtl);
+            }
+        }
+    }
+
+    /**
      * Serve cached full-page HTML from Redis DB 1/2 right after init() and canonical checks complete,
      * with Cold-Cache Stampede Protection (Dog-Pile Lock) and ps_ga_client_id tracking.
      */
@@ -570,6 +627,7 @@ class FrontController extends FrontControllerCore
                                 }
                                 if ($remTtl < ($extendTtl - 5)) {
                                     @$redis->expire($cacheKey, $extendTtl);
+                                    $this->registerFpcCacheTags($redis, $cacheKey, $extendTtl);
                                 }
                             }
                         }
@@ -638,6 +696,7 @@ class FrontController extends FrontControllerCore
                     }
                     $normalizedHtml = $this->prepareHtmlForFpcStorage($html);
                     @$redis->setex($this->fpcCacheKey, $ttl, $normalizedHtml);
+                    $this->registerFpcCacheTags($redis, $this->fpcCacheKey, $ttl);
                     @$redis->incr('fpc:stats:misses');
                 }
                 if ($this->fpcLockKey !== null) {

@@ -34,7 +34,7 @@ flowchart LR
 | Redis DB | Purpose | Flushing Behavior |
 | :--- | :--- | :--- |
 | `DB 0` | PHP Sessions (`session.save_handler = redis`) | Never touched by module flushes |
-| `DB 1`, `DB 2`, `DB 4+` | Per-shop Full-Page Microcache (auto-mapped per `id_shop`, skipping Reserve DB) | Flushed per shop on stock/order/BO events |
+| `DB 1`, `DB 2`, `DB 4+` | Per-shop Full-Page Microcache (auto-mapped per `id_shop`, skipping Reserve DB) | Targeted tag-set eviction (`fpc:tag:p:*`, `fpc:tag:c:*`, `fpc:tag:listings`) on stock/order/BO events; full flush on manual BO purge |
 | `DB 3` *(configurable)* | Atomic Stock Reservations (`sres:*`) | Completely isolated from FPC `FLUSHDB` |
 
 ---
@@ -49,6 +49,7 @@ Measured on a real multi-shop PrestaShop 8.x store (**Apache + PHP 8.4-FPM + Red
 | **Cold-Cache Stampede (10 simultaneous cold requests after flush)** | **`1 MISS` + `9 HIT-WAIT`** (1 MariaDB/Smarty render instead of 10) |
 | **Flash-Sale Contention (10 concurrent buyers carting 2 units)** | **`2 Succeeded` / `8 Blocked`** — **0 oversells**, holds auto-expire after configured TTL |
 | **Category Listing Cold Miss (`ps_product_listing_view` + bulk prefetch)** | **~5–10× fewer SQL queries** compared to vanilla `ProductAssemblerCore` |
+| **100 RPS (50 users, 30s) + 6 Stochastic Poisson Stock Invalidations** | Targeted Tag-Set Invalidation vs Full-Shop `FLUSHDB`: **`2,962/2,962 HTTP 200`** (vs 2 dropped client connections), **`p95 = 142.6 ms`** (`-65.5%` from `413.6 ms`), **`p99 = 251.6 ms`** (`-65.0%` from `718.0 ms`), **`Max = 687.5 ms`** (`-40.9%`), peak CPU **`65.1%`** (vs `95.3%`), misses **`85`** (`-47.5%`), stampede waits **`12`** (`-81.8%`), `php-fpm` max RSS **`2,283 MB`** (vs `4,078 MB`) |
 
 ---
 
@@ -62,6 +63,7 @@ Measured on a real multi-shop PrestaShop 8.x store (**Apache + PHP 8.4-FPM + Red
 * **Automatic Per-Customer Specific-Price Bypass:** Dynamically detects customers with custom `ps_specific_price` rows (cached in Redis for 5 min) and bypasses FPC for them.
 * **Cold-Cache Stampede Protection (Dog-Pile Lock):** Uses an atomic Redis `SET NX EX` lock so when 10+ buyers hit an uncached page simultaneously after a flush, only 1 worker renders from MariaDB/Smarty while concurrent requests wait briefly and receive `X-Page-Cache: HIT-WAIT`.
 * **Sliding TTL (Prolong on Hit):** Optionally refreshes a cached page's TTL back to the configured lifetime on active hits (throttled to at most once every 5s per page and clamped to the earliest expiring active stock hold) so hot catalog pages stay warm while preserving exact drop hold expiry.
+* **Targeted Redis Tag-Set FPC Invalidation:** Registers cached product (`fpc:tag:p:{id}`), category (`fpc:tag:c:{id}`), and global listing (`fpc:tag:listings`) keys in Redis tag sets so stock/order/reservation/catalog hooks evict only the affected product(s), their parent categories, and global listings via pipelined `UNLINK` (with automatic full-shop fallback), keeping unrelated products, categories, and CMS pages warm under high drop concurrency.
 * **Stampede Telemetry & PRG Back Office Controls:** Records the last 20 `HIT-WAIT` stampede saves (`fpc:stats:recent_wait_hits`) in Redis and renders them in a full-width Back Office dashboard table alongside live hit/miss/block counters and Post-Redirect-Get (PRG) cache/hold controls.
 
 ### 2. Zero-Oversell Atomic Stock Reservations (Drop Protection)
@@ -117,11 +119,11 @@ Measured on a real multi-shop PrestaShop 8.x store (**Apache + PHP 8.4-FPM + Red
 
 On install, `Ps_redis_perf::registerRequiredHooks()` registers the following 11 hooks:
 
-* `actionProductUpdate`, `actionProductDelete`, `actionProductSave`, `actionCategoryUpdate`, `actionOrderStatusPostUpdate` — flush affected shop Redis FPC DBs on Back Office catalog/order edits (when auto-flush is enabled)
-* `actionObjectImageAddAfter`, `actionObjectImageUpdateAfter`, `actionObjectImageDeleteAfter` — flush affected shop Redis FPC DBs and touch product `date_upd` / product cache
-* `actionUpdateQuantity` — always flush affected shop Redis FPC DBs when stock quantities change
-* `actionObjectProductInCartDeleteAfter` — immediately release the per-item Redis stock hold when a cart line is deleted
-* `actionValidateOrder` — immediately release all Redis stock holds (including linked Express duplicate aliases) for the completed cart and flush shop Redis FPC
+* `actionProductUpdate`, `actionProductDelete`, `actionProductSave`, `actionCategoryUpdate`, `actionOrderStatusPostUpdate` — perform targeted tag-set eviction (with full-shop fallback) on affected shop Redis FPC DBs on Back Office catalog/order edits when auto-flush is enabled
+* `actionObjectImageAddAfter`, `actionObjectImageUpdateAfter`, `actionObjectImageDeleteAfter` — perform targeted tag-set eviction for affected products and touch product `date_upd` / product cache
+* `actionUpdateQuantity` — always perform targeted tag-set eviction (affected product, parent categories, and global listings; fallback full-shop flush if IDs missing) when stock quantities change
+* `actionObjectProductInCartDeleteAfter` — immediately release the per-item Redis stock hold and evict affected product/category/listing tags
+* `actionValidateOrder` — immediately release all Redis stock holds (including linked Express duplicate aliases) for the completed cart and perform targeted eviction for the ordered products (or full-shop fallback)
 
 ---
 
@@ -129,8 +131,8 @@ On install, `Ps_redis_perf::registerRequiredHooks()` registers the following 11 
 
 This module overrides the following PrestaShop core classes (check for conflicts if you use other override-heavy modules):
 
-* `override/classes/controller/FrontController.php` — Redis FPC, stampede lock, CSRF token/cart personalization, PayPal & Buckaroo Express Option B guards
-* `override/classes/stock/StockAvailable.php` — Redis connection/DB mapping, atomic stock reservations, canonical cart alias resolution, bulk & single-product combination stock prefetching
+* `override/classes/controller/FrontController.php` — Redis FPC, targeted tag-set registration (`fpc:tag:p:{id}`, `fpc:tag:c:{id}`, `fpc:tag:listings`), stampede lock, CSRF token/cart personalization, PayPal & Buckaroo Express Option B guards
+* `override/classes/stock/StockAvailable.php` — Redis connection/DB mapping, atomic stock reservations, pipelined targeted tag-set FPC invalidation (`invalidateProductsFpcCache` / `invalidateCategoryFpcCache`), canonical cart alias resolution, bulk & single-product combination stock prefetching
 * `override/classes/Cart.php` — Atomic stock reservations for direct `Cart::updateQty()` / `Cart::duplicate()` (1-click Express Checkouts) and immediate hold release on `deleteProduct()` / `delete()`
 * `override/controllers/front/CartController.php` — Option A add-to-cart reservation
 * `override/controllers/front/OrderController.php` — Option B pre-payment reservation guard

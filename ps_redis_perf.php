@@ -12,7 +12,7 @@ class Ps_redis_perf extends Module
     {
         $this->name = 'ps_redis_perf';
         $this->tab = 'administration';
-        $this->version = '1.0.7';
+        $this->version = '1.0.8';
         $this->author = 'Slingomama';
         $this->need_instance = 0;
         $this->bootstrap = true;
@@ -366,6 +366,8 @@ class Ps_redis_perf extends Module
                     $loggedHits = $resetStats ? false : @$r->get('fpc:stats:logged_hits');
                     $cartHits = $resetStats ? false : @$r->get('fpc:stats:cart_hits');
                     $waitHits = $resetStats ? false : @$r->get('fpc:stats:wait_hits');
+                    $targetedInv = $resetStats ? false : @$r->get('fpc:stats:targeted_invalidations');
+                    $targetedEvicted = $resetStats ? false : @$r->get('fpc:stats:targeted_keys_evicted');
                     $recentWaitHits = $resetStats ? false : @$r->lRange('fpc:stats:recent_wait_hits', 0, 19);
 
                     @$r->flushDB();
@@ -389,6 +391,12 @@ class Ps_redis_perf extends Module
                         if ($waitHits !== false) {
                             @$r->set('fpc:stats:wait_hits', (int) $waitHits);
                         }
+                        if ($targetedInv !== false) {
+                            @$r->set('fpc:stats:targeted_invalidations', (int) $targetedInv);
+                        }
+                        if ($targetedEvicted !== false) {
+                            @$r->set('fpc:stats:targeted_keys_evicted', (int) $targetedEvicted);
+                        }
                         if (is_array($recentWaitHits) && !empty($recentWaitHits)) {
                             foreach ($recentWaitHits as $rwItem) {
                                 @$r->rPush('fpc:stats:recent_wait_hits', $rwItem);
@@ -404,6 +412,68 @@ class Ps_redis_perf extends Module
     }
 
     /**
+     * Resolve active managed shop IDs associated with an entity table (e.g. product_shop, category_shop).
+     *
+     * @param string $table
+     * @param string $column
+     * @param int $id
+     * @return array<int>
+     */
+    private function getShopIdsForEntity($table, $column, $id)
+    {
+        $managedShops = $this->getManagedShops();
+        $allShopIds = array_map('intval', array_keys($managedShops));
+        $id = (int) $id;
+        if ($id <= 0 || empty($allShopIds)) {
+            return $allShopIds;
+        }
+        $shopIdList = implode(',', $allShopIds);
+        try {
+            $rows = Db::getInstance(_PS_USE_SQL_SLAVE_)->executeS(
+                'SELECT DISTINCT `id_shop` FROM `' . _DB_PREFIX_ . bqSQL($table) . '` WHERE `' . bqSQL($column) . '` = ' . $id . ' AND `id_shop` IN (' . $shopIdList . ')'
+            );
+            if (!empty($rows)) {
+                $sids = [];
+                foreach ($rows as $r) {
+                    $sid = (int) ($r['id_shop'] ?? 0);
+                    if (isset($managedShops[$sid])) {
+                        $sids[] = $sid;
+                    }
+                }
+                $sids = array_values(array_unique($sids));
+                if (!empty($sids)) {
+                    return $sids;
+                }
+            }
+        } catch (\Throwable $e) {
+            // Fallback to all shops
+        }
+        return $allShopIds;
+    }
+
+    /**
+     * Resolve active shop IDs a product belongs to.
+     *
+     * @param int $idProduct
+     * @return array<int>
+     */
+    private function getShopIdsForProduct($idProduct)
+    {
+        return $this->getShopIdsForEntity('product_shop', 'id_product', (int) $idProduct);
+    }
+
+    /**
+     * Resolve active shop IDs a category belongs to.
+     *
+     * @param int $idCategory
+     * @return array<int>
+     */
+    private function getShopIdsForCategory($idCategory)
+    {
+        return $this->getShopIdsForEntity('category_shop', 'id_category', (int) $idCategory);
+    }
+
+    /**
      * Resolve which active shop Redis FPC DBs a product belongs to.
      *
      * @param int $idProduct
@@ -411,37 +481,115 @@ class Ps_redis_perf extends Module
      */
     private function getShopDbsForProduct($idProduct)
     {
-        $allDbs = $this->getAllShopFpcDbs();
-        $id = (int) $idProduct;
-        if ($id <= 0) {
-            return $allDbs;
-        }
         $managedShops = $this->getManagedShops();
-        $shopIdList = implode(',', array_map('intval', array_keys($managedShops)));
-        if ($shopIdList === '') {
-            return $allDbs;
+        $dbs = [];
+        foreach ($this->getShopIdsForProduct($idProduct) as $sid) {
+            if (isset($managedShops[$sid])) {
+                $dbs[] = (int) $managedShops[$sid]['db'];
+            }
         }
+        return !empty($dbs) ? array_values(array_unique($dbs)) : $this->getAllShopFpcDbs();
+    }
+
+    /**
+     * Map active shop IDs to their Redis FPC DB indices.
+     *
+     * @param array<int> $shopIds
+     * @return array<int>
+     */
+    private function mapShopIdsToDbs(array $shopIds)
+    {
+        $managedShops = $this->getManagedShops();
+        $dbs = [];
+        foreach ($shopIds as $sid) {
+            $sid = (int) $sid;
+            if (isset($managedShops[$sid])) {
+                $dbs[] = (int) $managedShops[$sid]['db'];
+            }
+        }
+        return !empty($dbs) ? array_values(array_unique($dbs)) : $this->getAllShopFpcDbs();
+    }
+
+    /**
+     * Extract unique positive product IDs from an Order and/or Cart object.
+     *
+     * @param object|null $order
+     * @param object|null $cart
+     * @return array<int>
+     */
+    private function extractProductIdsFromOrderOrCart($order = null, $cart = null)
+    {
+        $productIds = [];
+        $items = [];
         try {
-            $rows = Db::getInstance()->executeS(
-                'SELECT DISTINCT id_shop FROM `' . _DB_PREFIX_ . 'product_shop` WHERE id_product = ' . $id . ' AND id_shop IN (' . $shopIdList . ')'
-            );
-            if (!empty($rows)) {
-                $dbs = [];
-                foreach ($rows as $r) {
-                    $sid = (int) $r['id_shop'];
-                    if (isset($managedShops[$sid])) {
-                        $dbs[] = (int) $managedShops[$sid]['db'];
-                    }
+            if (is_object($order) && method_exists($order, 'getProducts')) {
+                $p = $order->getProducts();
+                if (is_array($p)) {
+                    $items = $p;
                 }
-                $dbs = array_values(array_unique($dbs));
-                if (!empty($dbs)) {
-                    return $dbs;
+            }
+            if (empty($items) && is_object($cart) && method_exists($cart, 'getProducts')) {
+                $p = $cart->getProducts(true);
+                if (is_array($p)) {
+                    $items = $p;
                 }
             }
         } catch (\Throwable $e) {
-            // Fallback to all shops
+            return [];
         }
-        return $allDbs;
+        foreach ($items as $item) {
+            $pid = (int) ($item['product_id'] ?? ($item['id_product'] ?? 0));
+            if ($pid > 0) {
+                $productIds[$pid] = $pid;
+            }
+        }
+        return array_values($productIds);
+    }
+
+    /**
+     * Targeted FPC invalidation for product IDs across the affected shops (with full-shop fallback).
+     *
+     * @param array<int> $productIds
+     * @param array<int> $shopIds
+     */
+    private function invalidateProductsInShops(array $productIds, array $shopIds = [])
+    {
+        $managedShops = $this->getManagedShops();
+        $targetShops = !empty($shopIds) ? array_values(array_unique(array_map('intval', $shopIds))) : array_keys($managedShops);
+        $cleanIds = array_values(array_unique(array_filter(array_map('intval', $productIds), function ($v) {
+            return $v > 0;
+        })));
+        if (!empty($cleanIds) && method_exists('StockAvailable', 'invalidateProductsFpcCache')) {
+            foreach ($targetShops as $sid) {
+                if (isset($managedShops[$sid])) {
+                    StockAvailable::invalidateProductsFpcCache($sid, $cleanIds);
+                }
+            }
+            return;
+        }
+        $this->purgeRedisPageCache(false, $this->mapShopIdsToDbs($targetShops));
+    }
+
+    /**
+     * Targeted FPC invalidation for a category across affected shops (with full-shop fallback).
+     *
+     * @param int $idCategory
+     * @param array<int> $shopIds
+     */
+    private function invalidateCategoryInShops($idCategory, array $shopIds = [])
+    {
+        $cid = (int) $idCategory;
+        $managedShops = $this->getManagedShops();
+        $targetShops = !empty($shopIds) ? array_values(array_unique(array_map('intval', $shopIds))) : array_keys($managedShops);
+        if ($cid > 0 && method_exists('StockAvailable', 'invalidateCategoryFpcCache')) {
+            foreach ($targetShops as $sid) {
+                if (isset($managedShops[$sid])) {
+                    StockAvailable::invalidateCategoryFpcCache($sid, $cid);
+                }
+            }
+            return;
+        }
+        $this->purgeRedisPageCache(false, $this->mapShopIdsToDbs($targetShops));
     }
 
     public function getContent()
@@ -500,6 +648,8 @@ class Ps_redis_perf extends Module
                         @$r->set('fpc:stats:logged_hits', 0);
                         @$r->set('fpc:stats:cart_hits', 0);
                         @$r->set('fpc:stats:wait_hits', 0);
+                        @$r->set('fpc:stats:targeted_invalidations', 0);
+                        @$r->set('fpc:stats:targeted_keys_evicted', 0);
                     }
                 }
                 if (@$r->select($reserveDb)) {
@@ -1351,7 +1501,7 @@ class Ps_redis_perf extends Module
             return;
         }
         $idProduct = (int) ($params['id_product'] ?? ($params['product']->id ?? 0));
-        $this->purgeRedisPageCache(false, $this->getShopDbsForProduct($idProduct));
+        $this->invalidateProductsInShops($idProduct > 0 ? [$idProduct] : [], $this->getShopIdsForProduct($idProduct));
     }
 
     public function hookActionProductDelete($params)
@@ -1360,14 +1510,14 @@ class Ps_redis_perf extends Module
             return;
         }
         $idProduct = (int) ($params['id_product'] ?? ($params['product']->id ?? 0));
-        $this->purgeRedisPageCache(false, $this->getShopDbsForProduct($idProduct));
+        $this->invalidateProductsInShops($idProduct > 0 ? [$idProduct] : [], $this->getShopIdsForProduct($idProduct));
     }
 
     public function hookActionObjectImageAddAfter($params)
     {
         $idProduct = (isset($params['object']) && $params['object'] instanceof Image) ? (int) $params['object']->id_product : 0;
         if ($this->shouldAutoFlushBoEdits()) {
-            $this->purgeRedisPageCache(false, $this->getShopDbsForProduct($idProduct));
+            $this->invalidateProductsInShops($idProduct > 0 ? [$idProduct] : [], $this->getShopIdsForProduct($idProduct));
         }
         if ($idProduct > 0) {
             $this->touchProduct($idProduct);
@@ -1378,7 +1528,7 @@ class Ps_redis_perf extends Module
     {
         $idProduct = (isset($params['object']) && $params['object'] instanceof Image) ? (int) $params['object']->id_product : 0;
         if ($this->shouldAutoFlushBoEdits()) {
-            $this->purgeRedisPageCache(false, $this->getShopDbsForProduct($idProduct));
+            $this->invalidateProductsInShops($idProduct > 0 ? [$idProduct] : [], $this->getShopIdsForProduct($idProduct));
         }
         if ($idProduct > 0) {
             $this->touchProduct($idProduct);
@@ -1389,7 +1539,7 @@ class Ps_redis_perf extends Module
     {
         $idProduct = (isset($params['object']) && $params['object'] instanceof Image) ? (int) $params['object']->id_product : 0;
         if ($this->shouldAutoFlushBoEdits()) {
-            $this->purgeRedisPageCache(false, $this->getShopDbsForProduct($idProduct));
+            $this->invalidateProductsInShops($idProduct > 0 ? [$idProduct] : [], $this->getShopIdsForProduct($idProduct));
         }
         if ($idProduct > 0) {
             $this->touchProduct($idProduct);
@@ -1402,13 +1552,13 @@ class Ps_redis_perf extends Module
             return;
         }
         $idProduct = (int) ($params['id_product'] ?? ($params['product']->id ?? 0));
-        $this->purgeRedisPageCache(false, $this->getShopDbsForProduct($idProduct));
+        $this->invalidateProductsInShops($idProduct > 0 ? [$idProduct] : [], $this->getShopIdsForProduct($idProduct));
     }
 
     public function hookActionUpdateQuantity($params)
     {
         $idProduct = (int) ($params['id_product'] ?? 0);
-        $this->purgeRedisPageCache(false, $this->getShopDbsForProduct($idProduct));
+        $this->invalidateProductsInShops($idProduct > 0 ? [$idProduct] : [], $this->getShopIdsForProduct($idProduct));
     }
 
     public function hookActionValidateOrder($params)
@@ -1416,10 +1566,10 @@ class Ps_redis_perf extends Module
         $idShop = (int) ($params['order']->id_shop ?? ($this->context->shop->id ?? 0));
         $idCart = (int) ($params['cart']->id ?? ($params['order']->id_cart ?? 0));
         if ($idCart > 0 && method_exists('StockAvailable', 'releaseAllCartReservations')) {
-            StockAvailable::releaseAllCartReservations($idCart, $idShop > 0 ? $idShop : null);
+            StockAvailable::releaseAllCartReservations($idCart, $idShop > 0 ? $idShop : null, false);
         }
-        $targetDbs = ($idShop > 0) ? [$this->getShopFpcDb($idShop)] : $this->getAllShopFpcDbs();
-        $this->purgeRedisPageCache(false, $targetDbs);
+        $productIds = $this->extractProductIdsFromOrderOrCart($params['order'] ?? null, $params['cart'] ?? null);
+        $this->invalidateProductsInShops($productIds, $idShop > 0 ? [$idShop] : []);
     }
 
     public function hookActionObjectProductInCartDeleteAfter($params)
@@ -1442,7 +1592,8 @@ class Ps_redis_perf extends Module
         if ($idOrder > 0) {
             $order = new Order($idOrder);
             if (Validate::isLoadedObject($order) && (int) $order->id_shop > 0) {
-                $this->purgeRedisPageCache(false, [$this->getShopFpcDb((int) $order->id_shop)]);
+                $productIds = $this->extractProductIdsFromOrderOrCart($order, null);
+                $this->invalidateProductsInShops($productIds, [(int) $order->id_shop]);
                 return;
             }
         }
@@ -1454,6 +1605,9 @@ class Ps_redis_perf extends Module
         if (!$this->shouldAutoFlushBoEdits()) {
             return;
         }
-        $this->purgeRedisPageCache(false, $this->getAllShopFpcDbs());
+        $idCategory = (int) (isset($params['category']) && is_object($params['category'])
+            ? ($params['category']->id ?? 0)
+            : ($params['id_category'] ?? 0));
+        $this->invalidateCategoryInShops($idCategory, $this->getShopIdsForCategory($idCategory));
     }
 }

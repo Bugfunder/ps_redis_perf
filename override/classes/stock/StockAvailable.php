@@ -620,9 +620,9 @@ class StockAvailable extends StockAvailableCore
 
             $remainingAfter = max(0, $availableForMe - $targetQty);
 
-            // If we just reserved the last available unit, flush this shop's FPC DB so other shoppers see it immediately
+            // If we just reserved the last available unit, invalidate this product & its categories/listings immediately
             if ($remainingAfter === 0) {
-                self::flushShopFpcCache($idShop);
+                self::invalidateProductFpcCache($idShop, $idProduct);
             }
 
             return [
@@ -805,7 +805,7 @@ class StockAvailable extends StockAvailableCore
             @$redis->sRem('sres:cart_items:s' . $idShop . ':' . $idCart, $idProduct . ':' . $idProductAttribute);
             @$redis->sRem('sres:active_holds:s' . $idShop, $hKey);
             if ($existed) {
-                self::flushShopFpcCache($idShop);
+                self::invalidateProductFpcCache($idShop, $idProduct);
             }
         } catch (\Throwable $e) {
             // Ignore
@@ -852,6 +852,7 @@ class StockAvailable extends StockAvailableCore
                 ))));
 
                 $releasedInShop = 0;
+                $releasedProductIds = [];
                 foreach ($cartIdsToClear as $cid) {
                     $cartItemsKey = 'sres:cart_items:s' . $sid . ':' . $cid;
                     $items = @$redis->sMembers($cartItemsKey);
@@ -862,7 +863,11 @@ class StockAvailable extends StockAvailableCore
                             $ipa = (int) ($p[1] ?? 0);
                             if ($idp > 0) {
                                 $hKey = 'sres:hold:s' . $sid . ':' . $idp . ':' . $ipa . ':' . $cid;
-                                $releasedInShop += (int) @$redis->del($hKey);
+                                $delCount = (int) @$redis->del($hKey);
+                                if ($delCount > 0) {
+                                    $releasedInShop += $delCount;
+                                    $releasedProductIds[$idp] = $idp;
+                                }
                                 @$redis->sRem('sres:item:s' . $sid . ':' . $idp . ':' . $ipa, (string) $cid);
                                 @$redis->sRem('sres:active_holds:s' . $sid, $hKey);
                             }
@@ -874,7 +879,11 @@ class StockAvailable extends StockAvailableCore
                 @$redis->del($childrenKey);
                 $totalReleased += $releasedInShop;
                 if ($flushFpc && $releasedInShop > 0) {
-                    self::flushShopFpcCache($sid);
+                    if (!empty($releasedProductIds)) {
+                        self::invalidateProductsFpcCache($sid, array_values($releasedProductIds));
+                    } else {
+                        self::flushShopFpcCache($sid);
+                    }
                 }
             } catch (\Throwable $e) {
                 // Ignore
@@ -935,6 +944,171 @@ class StockAvailable extends StockAvailableCore
     }
 
     /**
+     * Delete all cached pages referenced by the given Redis tag sets plus the tag sets themselves.
+     *
+     * @param int $idShop
+     * @param array<string> $tagKeys
+     * @return int Number of cached page keys evicted
+     */
+    protected static function deleteFpcTagKeys($idShop, array $tagKeys)
+    {
+        $idShop = (int) $idShop;
+        $tagKeys = array_values(array_unique(array_filter($tagKeys)));
+        if ($idShop <= 0 || empty($tagKeys)) {
+            return 0;
+        }
+        $dbId = self::resolveFpcDbIndex($idShop);
+        $r = self::connectPerfRedis($dbId);
+        if ($r === null) {
+            return 0;
+        }
+        try {
+            $pipe = @$r->multi(\Redis::PIPELINE);
+            if ($pipe === false) {
+                return 0;
+            }
+            foreach ($tagKeys as $tk) {
+                $pipe->sMembers($tk);
+            }
+            $results = @$pipe->exec();
+
+            $keysToDelete = [];
+            if (is_array($results)) {
+                foreach ($results as $members) {
+                    if (is_array($members)) {
+                        foreach ($members as $pageKey) {
+                            if (is_string($pageKey) && $pageKey !== '') {
+                                $keysToDelete[$pageKey] = true;
+                            }
+                        }
+                    }
+                }
+            }
+            $keysToDelete = array_keys($keysToDelete);
+            $allDel = array_values(array_unique(array_merge($keysToDelete, $tagKeys)));
+            foreach (array_chunk($allDel, 100) as $chunk) {
+                if (method_exists($r, 'unlink')) {
+                    @$r->unlink($chunk);
+                } else {
+                    @$r->del($chunk);
+                }
+            }
+            @$r->incr('fpc:stats:targeted_invalidations');
+            if (!empty($keysToDelete)) {
+                @$r->incrBy('fpc:stats:targeted_keys_evicted', count($keysToDelete));
+            }
+            return count($keysToDelete);
+        } catch (\Throwable $e) {
+            return 0;
+        }
+    }
+
+    /**
+     * Invalidate only the cached FPC pages for the given product ID(s), their parent
+     * categories, and global listing pages (falls back to full shop flush if invalid).
+     *
+     * @param int $idShop
+     * @param array<int> $productIds
+     * @param bool $includeListings
+     * @return int Evicted key count, or -1 if a full-shop fallback flush occurred
+     */
+    public static function invalidateProductsFpcCache($idShop, array $productIds, $includeListings = true)
+    {
+        $idShop = (int) $idShop;
+        if ($idShop <= 0) {
+            return 0;
+        }
+        $cleanIds = array_values(array_unique(array_filter(array_map('intval', $productIds), function ($v) {
+            return $v > 0;
+        })));
+        if (empty($cleanIds)) {
+            self::flushShopFpcCache($idShop);
+            return -1;
+        }
+
+        $tagKeys = [];
+        foreach ($cleanIds as $pid) {
+            $tagKeys[] = 'fpc:tag:p:' . $pid;
+        }
+
+        try {
+            $idList = implode(',', $cleanIds);
+            $rows = Db::getInstance(_PS_USE_SQL_SLAVE_)->executeS(
+                'SELECT DISTINCT `id_category` FROM `' . _DB_PREFIX_ . 'category_product` WHERE `id_product` IN (' . $idList . ')'
+            );
+            if ($rows === false) {
+                self::flushShopFpcCache($idShop);
+                return -1;
+            }
+            if (is_array($rows)) {
+                foreach ($rows as $row) {
+                    $cid = (int) ($row['id_category'] ?? 0);
+                    if ($cid > 0) {
+                        $tagKeys[] = 'fpc:tag:c:' . $cid;
+                    }
+                }
+            }
+        } catch (\Throwable $e) {
+            self::flushShopFpcCache($idShop);
+            return -1;
+        }
+
+        if ($includeListings) {
+            $tagKeys[] = 'fpc:tag:listings';
+        }
+
+        return self::deleteFpcTagKeys($idShop, $tagKeys);
+    }
+
+    /**
+     * Single-product targeted FPC invalidation wrapper.
+     *
+     * @param int $idShop
+     * @param int $idProduct
+     * @param bool $includeListings
+     * @return int
+     */
+    public static function invalidateProductFpcCache($idShop, $idProduct, $includeListings = true)
+    {
+        $idShop = (int) $idShop;
+        $pid = (int) $idProduct;
+        if ($idShop <= 0) {
+            return 0;
+        }
+        if ($pid <= 0) {
+            self::flushShopFpcCache($idShop);
+            return -1;
+        }
+        return self::invalidateProductsFpcCache($idShop, [$pid], $includeListings);
+    }
+
+    /**
+     * Targeted FPC invalidation for a single category (and global listing pages).
+     *
+     * @param int $idShop
+     * @param int $idCategory
+     * @param bool $includeListings
+     * @return int
+     */
+    public static function invalidateCategoryFpcCache($idShop, $idCategory, $includeListings = true)
+    {
+        $idShop = (int) $idShop;
+        $cid = (int) $idCategory;
+        if ($idShop <= 0) {
+            return 0;
+        }
+        if ($cid <= 0) {
+            self::flushShopFpcCache($idShop);
+            return -1;
+        }
+        $tagKeys = ['fpc:tag:c:' . $cid];
+        if ($includeListings) {
+            $tagKeys[] = 'fpc:tag:listings';
+        }
+        return self::deleteFpcTagKeys($idShop, $tagKeys);
+    }
+
+    /**
      * Flush a shop's Full-Page Cache DB while preserving hit/miss counters.
      *
      * @param int $idShop
@@ -957,6 +1131,8 @@ class StockAvailable extends StockAvailableCore
             $loggedHits = @$r->get('fpc:stats:logged_hits');
             $cartHits = @$r->get('fpc:stats:cart_hits');
             $waitHits = @$r->get('fpc:stats:wait_hits');
+            $targetedInv = @$r->get('fpc:stats:targeted_invalidations');
+            $targetedEvicted = @$r->get('fpc:stats:targeted_keys_evicted');
             $recentWaitHits = @$r->lRange('fpc:stats:recent_wait_hits', 0, 19);
             @$r->flushDB();
             if ($disabled === '1') {
@@ -976,6 +1152,12 @@ class StockAvailable extends StockAvailableCore
             }
             if ($waitHits !== false) {
                 @$r->set('fpc:stats:wait_hits', (int) $waitHits);
+            }
+            if ($targetedInv !== false) {
+                @$r->set('fpc:stats:targeted_invalidations', (int) $targetedInv);
+            }
+            if ($targetedEvicted !== false) {
+                @$r->set('fpc:stats:targeted_keys_evicted', (int) $targetedEvicted);
             }
             if (is_array($recentWaitHits) && !empty($recentWaitHits)) {
                 foreach ($recentWaitHits as $rwItem) {
