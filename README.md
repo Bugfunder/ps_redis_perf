@@ -82,6 +82,7 @@ Measured on a real multi-shop PrestaShop 8.x store (**Apache + PHP 8.4-FPM + Red
 * **Bulk Group Reduction & Multi-Format Image Duplication:** Single-query bulk `GroupReduction::duplicateReduction()` and multi-format (`jpg`/`webp`/`avif`/`2x`) file copy in `ProductDuplicator`.
 * **Lazy Listing Gallery Images & Cached Image Metadata (`ProductPresenterFactory`):** Resolves only the cover (and combination default) image eagerly on category/listing pages while lazily computing `$product['images']` on demand via `AbstractLazyArray::appendClosure()`, eliminates `N` redundant `new Product()` DB queries, and caches `ImageFormatConfiguration` / `ImageType` / `PS_HIGHT_DPI` once per request.
 * **Single-Product Combination Stock Auto-Prefetch & Per-Request Image Cache (`StockAvailable` + `Product`):** Automatically prefetches all combinations' stock for a product on its first Front-Office miss (`19× → 1×` SQL on multi-combination product pages, keeping `-0` context-shop alias keys invalidated via `Cache::clean()`), and caches `Product::getImages()` / `getCombinationImages()` per request in Front Office (`3× → 1×`).
+* **Product Page Combination Price Engine Bypass (`ProductController::assignAttributesGroups`):** Skips redundant per-combination `Product::getPriceStatic()` evaluations when no specific prices (`id_product IN (0, id)`), non-standard customer groups, or `actionProductPriceCalculation` hooks apply.
 
 ---
 
@@ -139,6 +140,7 @@ This module overrides the following PrestaShop core classes (check for conflicts
 * `override/classes/cache/Cache.php` — Configurable `Cache::setQuery()` bypass
 * `override/classes/GroupReduction.php` — Bulk single-query `duplicateReduction()`
 * `override/classes/ProductPresenterFactory.php` — Cover-only eager listing image resolution with lazy gallery fallback, zero-DB Product instantiation, and per-request image format/type caching
+* `override/controllers/front/ProductController.php` — Skips redundant per-combination `Product::getPriceStatic()` loops in `assignAttributesGroups()` when no specific prices apply
 
 ---
 
