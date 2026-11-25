@@ -1007,6 +1007,20 @@ class StockAvailable extends StockAvailableCore
             $idProd = (int) $comb->id_product;
         }
 
+        if ($idProd > 0 && !defined('_PS_ADMIN_DIR_')) {
+            $rawShopKey = (int) $id_shop;
+            $cacheKey = 'StockAvailable::getQuantityAvailableByProduct_' . $idProd . '-' . $idAttr . '-' . $rawShopKey;
+            if (!Cache::isStored($cacheKey)) {
+                $resolvedShop = ($id_shop !== null && (int) $id_shop > 0)
+                    ? (int) $id_shop
+                    : (int) (Context::getContext()->shop->id ?? 0);
+                $prefetchedKey = 'StockAvailable::getQuantityAvailableByProduct_' . $idProd . '-prefetched-' . $resolvedShop;
+                if ($resolvedShop > 0 && !Cache::isStored($prefetchedKey)) {
+                    self::prefetchStockForProducts([$idProd], $resolvedShop);
+                }
+            }
+        }
+
         $physicalQty = (int) parent::getQuantityAvailableByProduct($idProd > 0 ? $idProd : $id_product, $idAttr, $id_shop);
         if ($physicalQty <= 0 || $idProd <= 0 || defined('_PS_ADMIN_DIR_')) {
             return $physicalQty;
@@ -1035,16 +1049,25 @@ class StockAvailable extends StockAvailableCore
             return;
         }
 
+        $idShop = (int) $idShop;
         $idList = implode(',', array_map('intval', $productIds));
 
         // Determine the shop restriction columns
         $context = Context::getContext();
-        $shopGroup = $context->shop->getGroup();
+        $contextShopId = (int) ($context->shop->id ?? 0);
+        $storeContextAlias = ($contextShopId > 0 && $idShop === $contextShopId);
 
-        if ($shopGroup->share_stock) {
+        if ($storeContextAlias && $context->shop) {
+            $shopGroup = $context->shop->getGroup();
+        } else {
+            $shopGroupId = (int) Shop::getGroupFromShop($idShop, true);
+            $shopGroup = ($shopGroupId > 0) ? new ShopGroup($shopGroupId) : null;
+        }
+
+        if ($shopGroup && $shopGroup->share_stock) {
             $shopWhere = 'id_shop_group = ' . (int) $shopGroup->id . ' AND id_shop = 0';
         } else {
-            $shopWhere = 'id_shop = ' . (int) $idShop . ' AND id_shop_group = 0';
+            $shopWhere = 'id_shop = ' . $idShop . ' AND id_shop_group = 0';
         }
 
         // Single bulk query: fetch stock for ALL products × ALL their attributes
@@ -1063,22 +1086,38 @@ class StockAvailable extends StockAvailableCore
         // Inject each result into PrestaShop's Cache using the exact key
         // format that getQuantityAvailableByProduct() expects
         foreach ($rows as $row) {
-            $key = 'StockAvailable::getQuantityAvailableByProduct_'
-                 . (int) $row['id_product'] . '-'
-                 . (int) $row['id_product_attribute'] . '-'
-                 . (int) $idShop;
+            $pid = (int) $row['id_product'];
+            $ipa = (int) $row['id_product_attribute'];
+            $qty = (int) $row['qty'];
+            $key = 'StockAvailable::getQuantityAvailableByProduct_' . $pid . '-' . $ipa . '-' . $idShop;
             if (!Cache::isStored($key)) {
-                Cache::store($key, (int) $row['qty']);
+                Cache::store($key, $qty);
+            }
+            if ($storeContextAlias) {
+                $ctxKey = 'StockAvailable::getQuantityAvailableByProduct_' . $pid . '-' . $ipa . '-0';
+                if (!Cache::isStored($ctxKey)) {
+                    Cache::store($ctxKey, $qty);
+                }
             }
         }
 
-        // Also ensure attribute=0 entries exist for products that might
-        // not have a row with id_product_attribute=0
+        // Also ensure attribute=0 entries and prefetch markers exist for products that
+        // might not have a row with id_product_attribute=0
         foreach ($productIds as $pid) {
-            $key = 'StockAvailable::getQuantityAvailableByProduct_'
-                 . (int) $pid . '-0-' . (int) $idShop;
+            $pid = (int) $pid;
+            $key = 'StockAvailable::getQuantityAvailableByProduct_' . $pid . '-0-' . $idShop;
             if (!Cache::isStored($key)) {
                 Cache::store($key, 0);
+            }
+            if ($storeContextAlias) {
+                $ctxKey = 'StockAvailable::getQuantityAvailableByProduct_' . $pid . '-0-0';
+                if (!Cache::isStored($ctxKey)) {
+                    Cache::store($ctxKey, 0);
+                }
+            }
+            $prefetchedKey = 'StockAvailable::getQuantityAvailableByProduct_' . $pid . '-prefetched-' . $idShop;
+            if (!Cache::isStored($prefetchedKey)) {
+                Cache::store($prefetchedKey, true);
             }
         }
     }

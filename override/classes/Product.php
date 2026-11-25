@@ -4,6 +4,8 @@ class Product extends ProductCore
 {
     public static $bulk_images = null;
     public static $bulk_combination_images = null;
+    protected static $single_images_cache = [];
+    protected static $single_combination_images_cache = [];
 
     public function getImages($id_lang, Context $context = null)
     {
@@ -13,6 +15,18 @@ class Product extends ProductCore
         if (self::$bulk_images !== null && !isset(self::$bulk_images[$this->id])) {
             return [];
         }
+        $pid = (int) $this->id;
+        if (!defined('_PS_ADMIN_DIR_') && $pid > 0) {
+            $idShop = (int) (($context && $context->shop) ? $context->shop->id : (Context::getContext()->shop->id ?? 1));
+            $cacheKey = $idShop . '-' . $pid . '-' . (int) $id_lang;
+            if (array_key_exists($cacheKey, self::$single_images_cache)) {
+                return self::$single_images_cache[$cacheKey];
+            }
+            self::$single_images_cache[$cacheKey] = parent::getImages($id_lang, $context);
+
+            return self::$single_images_cache[$cacheKey];
+        }
+
         return parent::getImages($id_lang, $context);
     }
 
@@ -24,6 +38,17 @@ class Product extends ProductCore
         if (self::$bulk_combination_images !== null && !isset(self::$bulk_combination_images[$this->id])) {
             return [];
         }
+        $pid = (int) $this->id;
+        if (!defined('_PS_ADMIN_DIR_') && $pid > 0) {
+            $cacheKey = $pid . '-' . (int) $id_lang;
+            if (array_key_exists($cacheKey, self::$single_combination_images_cache)) {
+                return self::$single_combination_images_cache[$cacheKey];
+            }
+            self::$single_combination_images_cache[$cacheKey] = parent::getCombinationImages($id_lang);
+
+            return self::$single_combination_images_cache[$cacheKey];
+        }
+
         return parent::getCombinationImages($id_lang);
     }
 

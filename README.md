@@ -80,6 +80,8 @@ Measured on a real multi-shop PrestaShop 8.x store (**Apache + PHP 8.4-FPM + Red
 * **Session DB Write Throttling (`Cookie::getSession`):** Avoids running `UPDATE` queries on `ps_customer_session` / `ps_employee_session` on every page load by throttling writes to a configurable interval (default `300s`).
 * **Internal SQL Query Cache Bypass (`Cache::setQuery`):** Disables PrestaShop's legacy table-to-query cache map to eliminate serialization/write contention.
 * **Bulk Group Reduction & Multi-Format Image Duplication:** Single-query bulk `GroupReduction::duplicateReduction()` and multi-format (`jpg`/`webp`/`avif`/`2x`) file copy in `ProductDuplicator`.
+* **Lazy Listing Gallery Images & Cached Image Metadata (`ProductPresenterFactory`):** Resolves only the cover (and combination default) image eagerly on category/listing pages while lazily computing `$product['images']` on demand via `AbstractLazyArray::appendClosure()`, eliminates `N` redundant `new Product()` DB queries, and caches `ImageFormatConfiguration` / `ImageType` / `PS_HIGHT_DPI` once per request.
+* **Single-Product Combination Stock Auto-Prefetch & Per-Request Image Cache (`StockAvailable` + `Product`):** Automatically prefetches all combinations' stock for a product on its first Front-Office miss (`19× → 1×` SQL on multi-combination product pages, keeping `-0` context-shop alias keys invalidated via `Cache::clean()`), and caches `Product::getImages()` / `getCombinationImages()` per request in Front Office (`3× → 1×`).
 
 ---
 
@@ -127,15 +129,16 @@ On install, `Ps_redis_perf::registerRequiredHooks()` registers the following 11 
 This module overrides the following PrestaShop core classes (check for conflicts if you use other override-heavy modules):
 
 * `override/classes/controller/FrontController.php` — Redis FPC, stampede lock, CSRF token/cart personalization, PayPal & Buckaroo Express Option B guards
-* `override/classes/stock/StockAvailable.php` — Redis connection/DB mapping, atomic stock reservations, canonical cart alias resolution, bulk stock prefetching
+* `override/classes/stock/StockAvailable.php` — Redis connection/DB mapping, atomic stock reservations, canonical cart alias resolution, bulk & single-product combination stock prefetching
 * `override/classes/Cart.php` — Atomic stock reservations for direct `Cart::updateQty()` / `Cart::duplicate()` (1-click Express Checkouts) and immediate hold release on `deleteProduct()` / `delete()`
 * `override/controllers/front/CartController.php` — Option A add-to-cart reservation
 * `override/controllers/front/OrderController.php` — Option B pre-payment reservation guard
 * `override/classes/ProductAssembler.php` — MariaDB listing view fast-path + bulk prefetching
-* `override/classes/Product.php` — Bulk image, combination image, and front feature caches
+* `override/classes/Product.php` — Bulk & per-request Front-Office image/combination-image caches and bulk front feature prefetching
 * `override/classes/Cookie.php` — `ps_logged` cookie sync & throttled session DB writes
 * `override/classes/cache/Cache.php` — Configurable `Cache::setQuery()` bypass
 * `override/classes/GroupReduction.php` — Bulk single-query `duplicateReduction()`
+* `override/classes/ProductPresenterFactory.php` — Cover-only eager listing image resolution with lazy gallery fallback, zero-DB Product instantiation, and per-request image format/type caching
 
 ---
 
