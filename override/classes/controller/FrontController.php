@@ -86,6 +86,41 @@ class FrontController extends FrontControllerCore
                 Tools::redirect($cartUrl);
             }
         }
+
+        // Option B (Payment Stock Reservation) guard for Buckaroo Express (Apple Pay / Google Pay / PayPal) & Request initiation
+        if (
+            strtolower((string) Tools::getValue('module')) === 'buckaroo3'
+            && method_exists('StockAvailable', 'tryReserveWholeCartForPayment')
+        ) {
+            $bkController = strtolower((string) Tools::getValue('controller'));
+            if (
+                in_array($bkController, ['applepayexpress', 'googlepayexpress', 'paypalexpress'], true)
+                && strtolower((string) Tools::getValue('action')) === 'authorize'
+            ) {
+                $expressCartId = (int) ($this->context->cookie ? $this->context->cookie->__get('buckaroo_ape_cart') : 0);
+                $expressCart = ($expressCartId > 0) ? new Cart($expressCartId) : $this->context->cart;
+                if ($expressCart && Validate::isLoadedObject($expressCart) && !StockAvailable::tryReserveWholeCartForPayment($expressCart)) {
+                    http_response_code(200);
+                    header('Content-Type: application/json;charset=utf-8');
+                    header('Cache-Control: no-store');
+                    die(json_encode([
+                        'status' => 'error',
+                        'message' => 'Item is no longer available in requested quantity.',
+                        'field' => '',
+                    ]));
+                }
+            } elseif ($bkController === 'request' && $this->context->cart && $this->context->cart->id) {
+                if (!StockAvailable::tryReserveWholeCartForPayment($this->context->cart)) {
+                    $cartUrl = $this->context->link->getPageLink('cart', null, null, ['action' => 'show']);
+                    if ($this->ajax) {
+                        http_response_code(409);
+                        header('Content-Type: application/json');
+                        die(json_encode(['success' => false, 'errors' => true, 'cartUrl' => $cartUrl, 'message' => 'Item is no longer available in requested quantity.']));
+                    }
+                    Tools::redirect($cartUrl);
+                }
+            }
+        }
     }
 
     /**

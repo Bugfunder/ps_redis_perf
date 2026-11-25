@@ -167,17 +167,26 @@ class CartController extends CartControllerCore
                 }
             }
 
-            $update_quantity = $this->context->cart->updateQty(
-                $this->qty,
-                $this->id_product,
-                $this->id_product_attribute,
-                $this->customization_id,
-                Tools::getValue('op', 'up'),
-                $this->id_address_delivery,
-                null,
-                true,
-                true
-            );
+            if ($redisReserveResult !== null && property_exists('StockAvailable', 'skipNextCartUpdateQtyReserve')) {
+                StockAvailable::$skipNextCartUpdateQtyReserve = true;
+            }
+            try {
+                $update_quantity = $this->context->cart->updateQty(
+                    $this->qty,
+                    $this->id_product,
+                    $this->id_product_attribute,
+                    $this->customization_id,
+                    Tools::getValue('op', 'up'),
+                    $this->id_address_delivery,
+                    null,
+                    true,
+                    true
+                );
+            } finally {
+                if (property_exists('StockAvailable', 'skipNextCartUpdateQtyReserve')) {
+                    StockAvailable::$skipNextCartUpdateQtyReserve = false;
+                }
+            }
             if ($redisReserveResult !== null && ($update_quantity < 0 || !$update_quantity)) {
                 StockAvailable::restoreCartItemReservation(
                     (int) $this->context->cart->id,

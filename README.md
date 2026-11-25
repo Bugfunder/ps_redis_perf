@@ -23,7 +23,7 @@ flowchart LR
     PA -->|"Store HTML (TTL <= next hold expiry)"| R1
     W --> P
 
-    U -->|"POST Add to Cart / Pay"| CC["CartController / OrderController"]
+    U -->|"POST Add to Cart / Express / Pay"| CC["Cart / CartController / OrderController"]
     CC -->|"Atomic Per-Item Mutex"| R3["Redis Stock Holds DB (DB 3 — Isolated)"]
     R3 -->|"Available"| OK["Hold Unit (TTL 180s / 600s) + Flush Shop FPC"]
     R3 -->|"Depleted"| REJ["Immediate Reject (Zero Oversell)"]
@@ -61,11 +61,19 @@ Measured on a real multi-shop PrestaShop 8.x store (**Apache + PHP 8.4-FPM + Red
 * **Option 2 — In-Cart Caching (`cartCount > 0`):** Serves cached catalog/product pages even when a shopper already has items in their cart, dynamically injecting their personal `#_desktop_cart` widget and `products_count`.
 * **Automatic Per-Customer Specific-Price Bypass:** Dynamically detects customers with custom `ps_specific_price` rows (cached in Redis for 5 min) and bypasses FPC for them.
 * **Cold-Cache Stampede Protection (Dog-Pile Lock):** Uses an atomic Redis `SET NX EX` lock so when 10+ buyers hit an uncached page simultaneously after a flush, only 1 worker renders from MariaDB/Smarty while concurrent requests wait briefly and receive `X-Page-Cache: HIT-WAIT`.
+* **Sliding TTL (Prolong on Hit):** Optionally refreshes a cached page's TTL back to the configured lifetime on active hits (throttled to at most once every 5s per page and clamped to the earliest expiring active stock hold) so hot catalog pages stay warm while preserving exact drop hold expiry.
+* **Stampede Telemetry & PRG Back Office Controls:** Records the last 20 `HIT-WAIT` stampede saves (`fpc:stats:recent_wait_hits`) in Redis and renders them in a full-width Back Office dashboard table alongside live hit/miss/block counters and Post-Redirect-Get (PRG) cache/hold controls.
 
 ### 2. Zero-Oversell Atomic Stock Reservations (Drop Protection)
-* **Option A — Reserve Stock on Add-to-Cart:** Uses a per-item Redis mutex lock (`SET NX PX`) to atomically reserve units for a configurable TTL (default `180s` / 3 min). Eliminates overselling when many buyers click *Add to Cart* on limited stock at the exact same millisecond.
-* **Option B — Reserve Stock on Proceed-to-Payment:** Atomically holds all cart items for a configurable TTL (default `600s` / 10 min) right before external payment-gateway redirection (`OrderController::displayAjaxCheckCartStillOrderable` + PayPal `ecinit`/`scinit`).
+* **Option A — Reserve Stock on Add-to-Cart (`CartController` + `Cart`):** Uses a per-item Redis mutex lock (`SET NX PX`) to atomically reserve units for a configurable TTL (default `180s` / 3 min). Eliminates overselling when many buyers click *Add to Cart* on limited stock at the exact same millisecond, covering both standard `CartController` add-to-cart and direct `Cart::updateQty()` / `Cart::deleteProduct()` / `Cart::delete()` mutations used by product-page 1-click Express Checkouts (Apple Pay, Google Pay, PayPal Express) without modifying payment modules.
+* **Express Checkout Cart Duplication Aliasing (`Cart::duplicate()`):** When Express checkout modules (e.g., Buckaroo Apple Pay / Google Pay / PayPal Express) clone an active shopper's cart before payment authorization, the duplicate cart is linked in Redis (`sres:cart_alias:*` / `sres:cart_children:*`) to the canonical source cart and atomically validated via `tryReserveWholeCart()`. This prevents self-blocking against the shopper's own hold, continues blocking concurrent shoppers, keeps the source cart's hold intact if an abandoned Express duplicate is deleted, and releases both source and duplicate holds together on order validation (`releaseAllCartReservations()`). If the original hold expired and another shopper already claimed the stock, duplication aborts cleanly (`success: false`).
+* **Option B — Reserve Stock on Proceed-to-Payment:** Atomically holds all cart items for a configurable TTL (default `600s` / 10 min) right before external payment-gateway redirection (`OrderController::displayAjaxCheckCartStillOrderable`, PayPal `ecinit`/`scinit`, and Buckaroo `applepayexpress`/`googlepayexpress`/`paypalexpress` `action=authorize` and `request`).
 * **Hold-Aware FPC TTL Clamping:** Caps page-cache TTL to the earliest expiring active stock hold so abandoned carts automatically reappear in stock right when their hold expires.
+
+### 1-Click / Express Checkout Compatibility
+* Works out-of-the-box with **zero modifications to third-party payment modules** (`buckaroo3`, `paypal`, or any module using standard PrestaShop `Cart` APIs).
+* **Option A** automatically protects any Express checkout flow that calls `Cart::updateQty()`, `Cart::duplicate()`, `Cart::deleteProduct()`, or `Cart::delete()`.
+* **Option B** payment-stage guards explicitly recognize `OrderController::displayAjaxCheckCartStillOrderable()`, PayPal Express (`ecinit`, `scinit`), and Buckaroo Express (`applepayexpress`, `googlepayexpress`, `paypalexpress` with `action=authorize`, and `request`).
 
 ### 3. Cold-Miss Database, Session & Query Optimizations
 * **MariaDB Category Listing View (`ps_product_listing_view`) + Bulk Prefetching:** Offloads category product assembly, combination stock, and price hydration to a MariaDB view (auto-created on install) paired with bulk prefetchers for images, combination images, features, and stock (`ProductAssembler`, `Product`, `StockAvailable`).
@@ -102,12 +110,25 @@ Measured on a real multi-shop PrestaShop 8.x store (**Apache + PHP 8.4-FPM + Red
 
 ---
 
+## Registered PrestaShop Hooks
+
+On install, `Ps_redis_perf::registerRequiredHooks()` registers the following 11 hooks:
+
+* `actionProductUpdate`, `actionProductDelete`, `actionProductSave`, `actionCategoryUpdate`, `actionOrderStatusPostUpdate` — flush affected shop Redis FPC DBs on Back Office catalog/order edits (when auto-flush is enabled)
+* `actionObjectImageAddAfter`, `actionObjectImageUpdateAfter`, `actionObjectImageDeleteAfter` — flush affected shop Redis FPC DBs and touch product `date_upd` / product cache
+* `actionUpdateQuantity` — always flush affected shop Redis FPC DBs when stock quantities change
+* `actionObjectProductInCartDeleteAfter` — immediately release the per-item Redis stock hold when a cart line is deleted
+* `actionValidateOrder` — immediately release all Redis stock holds (including linked Express duplicate aliases) for the completed cart and flush shop Redis FPC
+
+---
+
 ## Core Overrides Included
 
 This module overrides the following PrestaShop core classes (check for conflicts if you use other override-heavy modules):
 
-* `override/classes/controller/FrontController.php` — Redis FPC, stampede lock, CSRF token/cart personalization, PayPal Option B guard
-* `override/classes/stock/StockAvailable.php` — Redis connection/DB mapping, atomic stock reservations, bulk stock prefetching
+* `override/classes/controller/FrontController.php` — Redis FPC, stampede lock, CSRF token/cart personalization, PayPal & Buckaroo Express Option B guards
+* `override/classes/stock/StockAvailable.php` — Redis connection/DB mapping, atomic stock reservations, canonical cart alias resolution, bulk stock prefetching
+* `override/classes/Cart.php` — Atomic stock reservations for direct `Cart::updateQty()` / `Cart::duplicate()` (1-click Express Checkouts) and immediate hold release on `deleteProduct()` / `delete()`
 * `override/controllers/front/CartController.php` — Option A add-to-cart reservation
 * `override/controllers/front/OrderController.php` — Option B pre-payment reservation guard
 * `override/classes/ProductAssembler.php` — MariaDB listing view fast-path + bulk prefetching

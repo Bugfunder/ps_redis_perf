@@ -4,6 +4,12 @@
  */
 class StockAvailable extends StockAvailableCore
 {
+    /** @var int Source cart ID while Cart::duplicate() is executing */
+    public static $duplicatingFromCartId = 0;
+
+    /** @var bool True when CartController already acquired the Redis hold immediately before calling Cart::updateQty() */
+    public static $skipNextCartUpdateQtyReserve = false;
+
     /**
      * Resolve the configured Redis DB index dedicated to stock reservations (default: 3).
      *
@@ -243,6 +249,177 @@ class StockAvailable extends StockAvailableCore
     }
 
     /**
+     * Detect front-office 1-click / Express Checkout requests (PayPal Express / Smart Button
+     * or Buckaroo Apple Pay / Google Pay / PayPal Express).
+     *
+     * @return bool
+     */
+    public static function isExpressCheckoutRequest()
+    {
+        if (defined('_PS_ADMIN_DIR_') || !class_exists('Tools', false)) {
+            return false;
+        }
+
+        $module = strtolower((string) Tools::getValue('module'));
+        $controller = strtolower((string) Tools::getValue('controller'));
+
+        if ($module === 'paypal' && in_array($controller, ['ecinit', 'scinit'], true)) {
+            return true;
+        }
+        if ($module === 'buckaroo3' && in_array($controller, ['applepayexpress', 'googlepayexpress', 'paypalexpress'], true)) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Resolve which reservation stage ('pay' or 'cart') applies to a direct Cart mutation
+     * such as Cart::updateQty() or Cart::duplicate(), or null if reservations are disabled.
+     *
+     * @param int|null $idShop
+     * @return string|null
+     */
+    public static function getActiveReservationStageForCartMutation($idShop = null)
+    {
+        if (self::isExpressCheckoutRequest() && self::isReservationEnabled('pay', $idShop)) {
+            return 'pay';
+        }
+        if (self::isReservationEnabled('cart', $idShop)) {
+            return 'cart';
+        }
+
+        return null;
+    }
+
+    /**
+     * Follow sres:alias links from duplicated express carts back to the canonical root cart ID.
+     *
+     * @param int $idCart
+     * @param int|null $idShop
+     * @return int
+     */
+    public static function resolveCanonicalCartId($idCart, $idShop = null)
+    {
+        $idCart = (int) $idCart;
+        if ($idCart <= 0) {
+            return 0;
+        }
+        if ($idShop === null) {
+            $idShop = (int) (Context::getContext()->shop->id ?? 1);
+        }
+        $idShop = (int) $idShop;
+
+        $redis = self::getReservationRedis();
+        if ($redis === null) {
+            return $idCart;
+        }
+
+        try {
+            $current = $idCart;
+            $seen = [$current => true];
+            for ($hop = 0; $hop < 3; $hop++) {
+                $parentRaw = @$redis->get('sres:alias:s' . $idShop . ':' . $current);
+                if (!is_string($parentRaw) || $parentRaw === '') {
+                    break;
+                }
+                $parentId = (int) $parentRaw;
+                if ($parentId <= 0 || isset($seen[$parentId])) {
+                    break;
+                }
+                $seen[$parentId] = true;
+                $current = $parentId;
+            }
+
+            return $current;
+        } catch (\Throwable $e) {
+            return $idCart;
+        }
+    }
+
+    /**
+     * Alias a duplicated cart ($newCartId) to the canonical root of $oldCartId so
+     * Express Checkouts share the shopper's hold without self-blocking or leaking holds.
+     *
+     * @param int $oldCartId
+     * @param int $newCartId
+     * @param int|null $idShop
+     */
+    public static function linkDuplicatedCart($oldCartId, $newCartId, $idShop = null)
+    {
+        $oldCartId = (int) $oldCartId;
+        $newCartId = (int) $newCartId;
+        if ($oldCartId <= 0 || $newCartId <= 0 || $oldCartId === $newCartId) {
+            return;
+        }
+        if ($idShop === null) {
+            $idShop = (int) (Context::getContext()->shop->id ?? 1);
+        }
+        $idShop = (int) $idShop;
+
+        $rootId = self::resolveCanonicalCartId($oldCartId, $idShop);
+        if ($rootId <= 0 || $rootId === $newCartId) {
+            return;
+        }
+
+        $redis = self::getReservationRedis();
+        if ($redis === null) {
+            return;
+        }
+
+        try {
+            $aliasTtl = max(
+                3600,
+                (int) Configuration::getGlobalValue('PS_REDIS_PERF_RESERVE_CART_TTL'),
+                (int) Configuration::getGlobalValue('PS_REDIS_PERF_RESERVE_PAYMENT_TTL')
+            );
+            @$redis->setex('sres:alias:s' . $idShop . ':' . $newCartId, $aliasTtl, (string) $rootId);
+            @$redis->sAdd('sres:children:s' . $idShop . ':' . $rootId, (string) $newCartId);
+            @$redis->expire('sres:children:s' . $idShop . ':' . $rootId, $aliasTtl);
+        } catch (\Throwable $e) {
+            // Ignore
+        }
+    }
+
+    /**
+     * Remove an express child cart alias when that child cart is deleted.
+     *
+     * @param int $childCartId
+     * @param int|null $idShop
+     * @return bool True if $childCartId had a parent alias that was unlinked
+     */
+    public static function unlinkDuplicatedCart($childCartId, $idShop = null)
+    {
+        $childCartId = (int) $childCartId;
+        if ($childCartId <= 0) {
+            return false;
+        }
+        if ($idShop === null) {
+            $idShop = (int) (Context::getContext()->shop->id ?? 1);
+        }
+        $idShop = (int) $idShop;
+
+        $redis = self::getReservationRedis();
+        if ($redis === null) {
+            return false;
+        }
+
+        try {
+            $aliasKey = 'sres:alias:s' . $idShop . ':' . $childCartId;
+            $parentRaw = @$redis->get($aliasKey);
+            if (!is_string($parentRaw) || (int) $parentRaw <= 0) {
+                return false;
+            }
+            @$redis->del($aliasKey);
+            @$redis->sRem('sres:children:s' . $idShop . ':' . (int) $parentRaw, (string) $childCartId);
+
+            return true;
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+
+    /**
      * Calculate how many units of ($idProduct, $idProductAttribute) are currently reserved
      * in Redis DB 3 by OTHER customers' carts or checkout sessions.
      *
@@ -266,6 +443,7 @@ class StockAvailable extends StockAvailableCore
         if ($excludeCartId === null) {
             $excludeCartId = (int) ($context->cart->id ?? ($context->cookie->id_cart ?? 0));
         }
+        $excludeCartId = self::resolveCanonicalCartId($excludeCartId, $idShop);
 
         $redis = self::getReservationRedis();
         if ($redis === null) {
@@ -328,6 +506,11 @@ class StockAvailable extends StockAvailableCore
         ];
 
         if ($idCart <= 0 || $idProduct <= 0 || !self::isReservationEnabled($stage, $idShop)) {
+            return $defaultOk;
+        }
+
+        $idCart = self::resolveCanonicalCartId($idCart, $idShop);
+        if ($idCart <= 0) {
             return $defaultOk;
         }
 
@@ -483,6 +666,7 @@ class StockAvailable extends StockAvailableCore
             $idShop = (int) (Context::getContext()->shop->id ?? 1);
         }
         $idShop = (int) $idShop;
+        $idCart = self::resolveCanonicalCartId($idCart, $idShop);
 
         $redis = self::getReservationRedis();
         if ($redis === null || $idCart <= 0 || $idProduct <= 0) {
@@ -518,19 +702,21 @@ class StockAvailable extends StockAvailableCore
     }
 
     /**
-     * Atomically reserve every product in $cart for payment ('pay' stage).
+     * Atomically reserve every product in $cart for the requested stage ('cart' or 'pay').
      * Rolls back all newly acquired holds in this call if any single product fails.
      *
      * @param Cart $cart
-     * @return bool True if all items are reserved (or Option B disabled), false if out of stock
+     * @param string $stage 'cart' or 'pay'
+     * @return bool True if all items are reserved (or stage is disabled), false if out of stock
      */
-    public static function tryReserveWholeCartForPayment(Cart $cart)
+    public static function tryReserveWholeCart(Cart $cart, $stage = 'pay')
     {
         if (!$cart || !$cart->id) {
             return true;
         }
+        $stage = ($stage === 'cart') ? 'cart' : 'pay';
         $idShop = (int) ($cart->id_shop ?: (Context::getContext()->shop->id ?? 1));
-        if (!self::isReservationEnabled('pay', $idShop)) {
+        if (!self::isReservationEnabled($stage, $idShop)) {
             return true;
         }
 
@@ -557,9 +743,9 @@ class StockAvailable extends StockAvailableCore
 
         $acquired = [];
         foreach ($needed as $item) {
-            $res = self::tryReserveCartItem($cart->id, $item['idp'], $item['ipa'], $item['qty'], 'pay', $idShop);
+            $res = self::tryReserveCartItem($cart->id, $item['idp'], $item['ipa'], $item['qty'], $stage, $idShop);
             if (!$res['ok']) {
-                // Roll back any holds upgraded/created during this payment attempt
+                // Roll back any holds upgraded/created during this attempt
                 foreach ($acquired as $prev) {
                     self::restoreCartItemReservation($cart->id, $prev['idp'], $prev['ipa'], $prev['prev_payload'], $idShop);
                 }
@@ -573,6 +759,17 @@ class StockAvailable extends StockAvailableCore
         }
 
         return true;
+    }
+
+    /**
+     * Atomically reserve every product in $cart for payment ('pay' stage).
+     *
+     * @param Cart $cart
+     * @return bool True if all items are reserved (or Option B disabled), false if out of stock
+     */
+    public static function tryReserveWholeCartForPayment(Cart $cart)
+    {
+        return self::tryReserveWholeCart($cart, 'pay');
     }
 
     /**
@@ -595,9 +792,10 @@ class StockAvailable extends StockAvailableCore
             $idShop = (int) (Context::getContext()->shop->id ?? 1);
         }
         $idShop = (int) $idShop;
+        $idCart = self::resolveCanonicalCartId($idCart, $idShop);
 
         $redis = self::getReservationRedis();
-        if ($redis === null) {
+        if ($redis === null || $idCart <= 0) {
             return;
         }
         try {
@@ -615,16 +813,19 @@ class StockAvailable extends StockAvailableCore
     }
 
     /**
-     * Release all Redis DB 3 stock reservations held by a cart (e.g. when an order is validated).
+     * Release all Redis DB 3 stock reservations held by a cart (including duplicated express
+     * aliases/source cart links), returning the number of hold keys released.
      *
      * @param int $idCart
      * @param int|null $idShop
+     * @param bool $flushFpc
+     * @return int
      */
-    public static function releaseAllCartReservations($idCart, $idShop = null)
+    public static function releaseAllCartReservations($idCart, $idShop = null, $flushFpc = false)
     {
         $idCart = (int) $idCart;
         if ($idCart <= 0) {
-            return;
+            return 0;
         }
         if ($idShop !== null && (int) $idShop > 0) {
             $shopsToCheck = [(int) $idShop];
@@ -637,30 +838,50 @@ class StockAvailable extends StockAvailableCore
 
         $redis = self::getReservationRedis();
         if ($redis === null) {
-            return;
+            return 0;
         }
+        $totalReleased = 0;
         foreach ($shopsToCheck as $sid) {
             try {
-                $cartItemsKey = 'sres:cart_items:s' . $sid . ':' . $idCart;
-                $items = @$redis->sMembers($cartItemsKey);
-                if (is_array($items)) {
-                    foreach ($items as $pair) {
-                        $p = explode(':', (string) $pair);
-                        $idp = (int) ($p[0] ?? 0);
-                        $ipa = (int) ($p[1] ?? 0);
-                        if ($idp > 0) {
-                            $hKey = 'sres:hold:s' . $sid . ':' . $idp . ':' . $ipa . ':' . $idCart;
-                            @$redis->del($hKey);
-                            @$redis->sRem('sres:item:s' . $sid . ':' . $idp . ':' . $ipa, (string) $idCart);
-                            @$redis->sRem('sres:active_holds:s' . $sid, $hKey);
+                $rootId = self::resolveCanonicalCartId($idCart, $sid);
+                $childrenKey = 'sres:children:s' . $sid . ':' . $rootId;
+                $children = @$redis->sMembers($childrenKey);
+                $cartIdsToClear = array_values(array_unique(array_filter(array_map(
+                    'intval',
+                    array_merge([$idCart, $rootId], is_array($children) ? $children : [])
+                ))));
+
+                $releasedInShop = 0;
+                foreach ($cartIdsToClear as $cid) {
+                    $cartItemsKey = 'sres:cart_items:s' . $sid . ':' . $cid;
+                    $items = @$redis->sMembers($cartItemsKey);
+                    if (is_array($items)) {
+                        foreach ($items as $pair) {
+                            $p = explode(':', (string) $pair);
+                            $idp = (int) ($p[0] ?? 0);
+                            $ipa = (int) ($p[1] ?? 0);
+                            if ($idp > 0) {
+                                $hKey = 'sres:hold:s' . $sid . ':' . $idp . ':' . $ipa . ':' . $cid;
+                                $releasedInShop += (int) @$redis->del($hKey);
+                                @$redis->sRem('sres:item:s' . $sid . ':' . $idp . ':' . $ipa, (string) $cid);
+                                @$redis->sRem('sres:active_holds:s' . $sid, $hKey);
+                            }
                         }
                     }
+                    @$redis->del($cartItemsKey);
+                    @$redis->del('sres:alias:s' . $sid . ':' . $cid);
                 }
-                @$redis->del($cartItemsKey);
+                @$redis->del($childrenKey);
+                $totalReleased += $releasedInShop;
+                if ($flushFpc && $releasedInShop > 0) {
+                    self::flushShopFpcCache($sid);
+                }
             } catch (\Throwable $e) {
                 // Ignore
             }
         }
+
+        return $totalReleased;
     }
 
     /**

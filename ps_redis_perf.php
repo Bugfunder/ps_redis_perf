@@ -1190,7 +1190,7 @@ class Ps_redis_perf extends Module
                         'label' => $this->l('Option A: Reserve Stock on Add to Cart'),
                         'name' => 'PS_REDIS_PERF_RESERVE_CART_ENABLED',
                         'is_bool' => true,
-                        'desc' => $this->l('Strict Drop Mode: When a customer adds a product to their cart, atomically hold that unit in Redis using a per-item mutex lock. If 10 users try to cart 2 available units at the exact same millisecond, only 2 succeed and 8 are immediately rejected. Hold auto-expires after the Cart Reservation TTL if unpaid.'),
+                        'desc' => $this->l('Strict Drop Mode: When a customer adds a product to their cart (including 1-click Express Checkouts using Cart::updateQty() or Cart::duplicate() for Apple Pay, Google Pay, and PayPal Express), atomically hold that unit in Redis using a per-item mutex lock. If 10 users try to cart 2 available units at the exact same millisecond, only 2 succeed and 8 are immediately rejected. Hold auto-expires after the Cart Reservation TTL if unpaid.'),
                         'values' => [
                             ['id' => 'res_cart_on', 'value' => 1, 'label' => $this->l('Enabled')],
                             ['id' => 'res_cart_off', 'value' => 0, 'label' => $this->l('Disabled')],
@@ -1209,7 +1209,7 @@ class Ps_redis_perf extends Module
                         'label' => $this->l('Option B: Reserve Stock on Proceed to Payment'),
                         'name' => 'PS_REDIS_PERF_RESERVE_PAYMENT_ENABLED',
                         'is_bool' => true,
-                        'desc' => $this->l('When a customer clicks the final Pay button, atomically lock every item in their cart in Redis before redirecting to the external payment gateway. Prevents simultaneous payment-redirect oversells (backorders).'),
+                        'desc' => $this->l('When a customer clicks the final Pay button (or initiates PayPal ecinit/scinit or Buckaroo applepayexpress/googlepayexpress/paypalexpress authorize or request), atomically lock every item in their cart in Redis before redirecting to the external payment gateway. Prevents simultaneous payment-redirect oversells (backorders).'),
                         'values' => [
                             ['id' => 'res_pay_on', 'value' => 1, 'label' => $this->l('Enabled')],
                             ['id' => 'res_pay_off', 'value' => 0, 'label' => $this->l('Disabled')],
